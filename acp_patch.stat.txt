@@ -1,0 +1,7 @@
+ content/browser/renderer_host/render_widget_host_view_android.cc |   7 +++--
+ ui/base/android/constants.h                                      |  22 ++++++++++++++
+ ui/base/android/window_android.cc                                | 136 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ ui/base/android/window_android.h                                 |  26 +++++++++++++++++
+ ui/base/ui_base_switches.cc                                      |   9 ++++++
+ ui/base/ui_base_switches.h                                       |   3 ++
+ 6 files changed, 200 insertions(+), 3 deletions(-)

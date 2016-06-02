@@ -1,0 +1,23 @@
+ base/assisted_scheduling/assisted_scheduler.cc                   | 163 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ base/assisted_scheduling/assisted_scheduler.h                    |  79 ++++++++++++++++++++++++++++++++++++++++++
+ base/assisted_scheduling/qos_monitor.cc                          | 160 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ base/assisted_scheduling/qos_monitor.h                           |  59 ++++++++++++++++++++++++++++++++
+ base/base.gypi                                                   |   7 ++++
+ base/base_switches.cc                                            |   3 ++
+ base/base_switches.h                                             |   3 ++
+ base/third_party/cpu_info/cpu_info_switches.cc                   |  18 ++++++++++
+ base/third_party/cpu_info/cpu_info_switches.h                    |  21 ++++++++++++
+ base/threading/platform_thread.h                                 |  18 ++++++++++
+ base/threading/platform_thread_assisted_scheduling_android.cc    |  97 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ cc/output/output_surface.h                                       |   5 +++
+ cc/resources/raster_worker_pool.cc                               |   3 ++
+ cc/trees/layer_tree_host_impl.cc                                 |  15 ++++++++
+ content/app/content_main_runner.cc                               |   2 ++
+ content/browser/renderer_host/render_process_host_impl.cc        |   1 +
+ content/browser/renderer_host/render_widget_host_view_android.cc |   8 +++++
+ content/browser/renderer_host/render_widget_host_view_android.h  |   4 +++
+ content/common/view_messages.h                                   |   7 ++++
+ content/renderer/gpu/compositor_output_surface.cc                |  15 ++++++++
+ content/renderer/gpu/compositor_output_surface.h                 |   4 +++
+ gpu/command_buffer/service/async_pixel_transfer_manager_egl.cc   |   4 +++
+ 22 files changed, 696 insertions(+)

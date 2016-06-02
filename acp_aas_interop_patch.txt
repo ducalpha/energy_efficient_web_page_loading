@@ -1,0 +1,187 @@
+diff --git a/base/assisted_scheduling/assisted_scheduler.h b/base/assisted_scheduling/assisted_scheduler.h
+index fc9dd60..f3a0517 100644
+--- a/base/assisted_scheduling/assisted_scheduler.h
++++ b/base/assisted_scheduling/assisted_scheduler.h
+@@ -49,6 +49,10 @@ class BASE_EXPORT AssistedScheduler {
+     return mode_;
+   }
+ 
++  bool Enabled() const {
++    return enabled_;
++  }
++
+  private:
+   // Set current mode and scheduler threads accordingly
+   // Return true if current mode changed
+diff --git a/base/assisted_scheduling/qos_monitor.cc b/base/assisted_scheduling/qos_monitor.cc
+index 570b2d1..987a1ac 100644
+--- a/base/assisted_scheduling/qos_monitor.cc
++++ b/base/assisted_scheduling/qos_monitor.cc
+@@ -35,6 +35,8 @@ QosMonitor::QosMonitor()
+ 
+   // Although QoS monitor may work independently, it binds to AssistedScheduler for now
+   // since the AssistedScheduler is the only its user
++  // Also, Qos monitor is enabled on renderer process only
++  // because the QoS is the frame rate of rendering the web page, not the UI on the browser process   
+   enabled_ = is_on_renderer_process &&
+       CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAssistedScheduling);
+ }
+@@ -74,7 +76,7 @@ bool QosMonitor::IsQosSatisfied() {
+     return true;
+ 
+   int frame_count = 0;
+-  RingBufferType::Iterator it = --frame_begin_time_history_.End();
++  RingBufferType::Iterator it = frame_begin_time_history_.End();
+   // Count number of frames in the last qos_satisaction window
+   for (; it; --it) {
+     delta = most_recent_frame_time - frame_begin_time_history_.ReadBuffer(it.index()); 
+@@ -96,7 +98,9 @@ bool QosMonitor::IsQosSatisfied() {
+         delta.InMilliseconds() * qos_satisfaction_minimum_frames_per_sec / MILLIS_IN_SEC;
+   VLOG(1) << "Frame count: " << frame_count << " qos satisfaction frame count: " << qos_satifaction_frame_count;
+ 
+-  if (frame_count > qos_satifaction_frame_count)
++  // Tolerance 10%, sometimes, frame counting sometimes misses some frames
++  const int tolerance = 10;
++  if (frame_count >= (100 - tolerance) * qos_satifaction_frame_count / 100)
+     return true;
+ 
+   // Countinue to count number of frames in the last qos_violation window 
+@@ -115,7 +119,7 @@ bool QosMonitor::IsQosSatisfied() {
+         delta.InMilliseconds() * qos_violation_minimum_frames_per_sec / MILLIS_IN_SEC;
+   VLOG(1) << "Frame count: " << frame_count << " qos violation frame count: " << qos_violation_frame_count;
+ 
+-  if (frame_count < qos_violation_frame_count) {
++  if (frame_count < (100 - tolerance) * qos_violation_frame_count / 100) {
+     VLOG(1) << "QoS violated!";
+     return false;
+   }
+@@ -131,6 +135,7 @@ void QosMonitor::SetRequiredFps(size_t required_fps) {
+ 
+   VLOG(1) << "Required fps changes to " << required_fps;
+ 
++  // Clear fps history to prevent noise from previous policy
+   ClearHistory("Required fps changed");
+ }
+ 
+@@ -139,7 +144,7 @@ void QosMonitor::ClearHistory(const std::string& reason) {
+     return;
+       
+   // Clear frame begin time history when required_fps changes
+-  VLOG(1) << "RequiredFpsChanged because of " << reason;
++  VLOG(1) << "QosMonitor::ClearHistory because of " << reason;
+   TRACE_EVENT1("cc", "FrameRateCounter::RequiredFpsChanged",
+                "reason", reason);
+ 
+diff --git a/base/assisted_scheduling/qos_monitor.h b/base/assisted_scheduling/qos_monitor.h
+index c22f04e..266e852 100644
+--- a/base/assisted_scheduling/qos_monitor.h
++++ b/base/assisted_scheduling/qos_monitor.h
+@@ -35,10 +35,6 @@ class BASE_EXPORT QosMonitor {
+   // TODO: add more information to history to distinguish cases
+   void ClearHistory(const std::string& reason);
+ 
+-  bool Enabled() const {
+-    return enabled_;
+-  }
+-
+  private:
+   TimeDelta RecentFrameInterval(size_t n) const;
+ 
+diff --git a/content/browser/renderer_host/render_widget_host_view_android.cc b/content/browser/renderer_host/render_widget_host_view_android.cc
+index d00a4d1..40acc1a 100644
+--- a/content/browser/renderer_host/render_widget_host_view_android.cc
++++ b/content/browser/renderer_host/render_widget_host_view_android.cc
+@@ -7,6 +7,7 @@
+ #include <android/bitmap.h>
+ 
+ #include "base/android/build_info.h"
++#include "base/assisted_scheduling/qos_monitor.h"
+ #include "base/basictypes.h"
+ #include "base/bind.h"
+ #include "base/callback_helpers.h"
+@@ -1272,9 +1273,18 @@ void RenderWidgetHostViewAndroid::SendBeginFrame(base::TimeTicks frame_time,
+ 
+   base::TimeTicks deadline = display_time - estimated_browser_composite_time;
+ 
+-  host_->Send(new ViewMsg_BeginFrame(
+-      host_->GetRoutingID(),
+-      cc::BeginFrameArgs::Create(frame_time, deadline, vsync_period)));
++  // ducalpha: update renderer the new fps_limit only when QosMonitor on renderer process is enabled
++  // that means the AssistedScheduler on the browser process in enabled
++  if (base::AssistedScheduler::GetInstance()->Enabled()) {
++    host_->Send(new ViewMsg_BeginFrameWithQosInfo(
++        host_->GetRoutingID(),
++        cc::BeginFrameArgs::Create(frame_time, deadline, vsync_period),
++        content_view_core_->GetWindowAndroid()->FpsLimit()));
++  } else { // original
++    host_->Send(new ViewMsg_BeginFrame(
++        host_->GetRoutingID(),
++        cc::BeginFrameArgs::Create(frame_time, deadline, vsync_period)));
++  }
+ }
+ 
+ bool RenderWidgetHostViewAndroid::Animate(base::TimeTicks frame_time) {
+diff --git a/content/common/view_messages.h b/content/common/view_messages.h
+index 928251e..daa7dfb 100644
+--- a/content/common/view_messages.h
++++ b/content/common/view_messages.h
+@@ -938,6 +938,12 @@ IPC_MESSAGE_ROUTED0(ViewMsg_ShowImeIfNeeded)
+ IPC_MESSAGE_ROUTED1(ViewMsg_BeginFrame,
+                     cc::BeginFrameArgs /* args */)
+ 
++// ducalpha:
++// fps_limit-included ViewMsg_BeginFrame
++IPC_MESSAGE_ROUTED2(ViewMsg_BeginFrameWithQosInfo,
++                    cc::BeginFrameArgs /* args */,
++                    int /* fps_limit*/)
++
+ // Sent by the browser when an IME update that requires acknowledgement has been
+ // processed on the browser side.
+ IPC_MESSAGE_ROUTED0(ViewMsg_ImeEventAck)
+diff --git a/content/renderer/gpu/compositor_output_surface.cc b/content/renderer/gpu/compositor_output_surface.cc
+index d5badf1..abc857f 100644
+--- a/content/renderer/gpu/compositor_output_surface.cc
++++ b/content/renderer/gpu/compositor_output_surface.cc
+@@ -42,6 +42,7 @@ IPC::ForwardingMessageFilter* CompositorOutputSurface::CreateFilter(
+     ViewMsg_SwapCompositorFrameAck::ID,
+     ViewMsg_ReclaimCompositorResources::ID,
+ #if defined(OS_ANDROID)
++    ViewMsg_BeginFrameWithQosInfo::ID,
+     ViewMsg_BeginFrame::ID
+ #endif
+   };
+@@ -210,6 +211,7 @@ void CompositorOutputSurface::OnMessageReceived(const IPC::Message& message) {
+     IPC_MESSAGE_HANDLER(ViewMsg_ReclaimCompositorResources, OnReclaimResources);
+ #if defined(OS_ANDROID)
+     IPC_MESSAGE_HANDLER(ViewMsg_BeginFrame, OnBeginFrame);
++    IPC_MESSAGE_HANDLER(ViewMsg_BeginFrameWithQosInfo, OnBeginFrameWithQosInfo);
+ #endif
+   IPC_END_MESSAGE_MAP()
+ }
+@@ -240,6 +242,14 @@ void CompositorOutputSurface::OnBeginFrame(const cc::BeginFrameArgs& args) {
+   DCHECK(CalledOnValidThread());
+   client_->BeginFrame(args);
+ }
++
++// ducalpha
++void CompositorOutputSurface::OnBeginFrameWithQosInfo(const cc::BeginFrameArgs& args,
++                                                      int fps_limit) {
++  OnBeginFrame(args);
++
++  base::QosMonitor::GetInstance()->SetRequiredFps(fps_limit);
++}
+ #endif  // defined(OS_ANDROID)
+ 
+ void CompositorOutputSurface::OnSwapAck(uint32 output_surface_id,
+diff --git a/content/renderer/gpu/compositor_output_surface.h b/content/renderer/gpu/compositor_output_surface.h
+index 516e211..90c19aa 100644
+--- a/content/renderer/gpu/compositor_output_surface.h
++++ b/content/renderer/gpu/compositor_output_surface.h
+@@ -106,6 +106,7 @@ class CompositorOutputSurface
+                                           base::TimeDelta interval);
+ #if defined(OS_ANDROID)
+   void OnBeginFrame(const cc::BeginFrameArgs& args);
++  void OnBeginFrameWithQosInfo(const cc::BeginFrameArgs& args, int fps_limit);
+ #endif
+   bool Send(IPC::Message* message);
+ 

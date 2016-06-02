@@ -1,0 +1,799 @@
+diff --git a/content/browser/loader/async_resource_handler.cc b/content/browser/loader/async_resource_handler.cc
+index 87d82ca..f406985e 100644
+--- a/content/browser/loader/async_resource_handler.cc
++++ b/content/browser/loader/async_resource_handler.cc
+@@ -10,10 +10,14 @@
+ #include "base/command_line.h"
+ #include "base/containers/hash_tables.h"
+ #include "base/debug/alias.h"
++#include "base/debug/trace_event.h"
++#include "base/lazy_instance.h"
+ #include "base/logging.h"
++#include "base/macros.h"
+ #include "base/memory/shared_memory.h"
+ #include "base/metrics/histogram.h"
+ #include "base/strings/string_number_conversions.h"
++#include "cc/debug/ring_buffer.h" // TODO: move this useful class to base/
+ #include "content/browser/devtools/devtools_netlog_observer.h"
+ #include "content/browser/host_zoom_map_impl.h"
+ #include "content/browser/loader/resource_buffer.h"
+@@ -24,6 +28,7 @@
+ #include "content/common/resource_messages.h"
+ #include "content/common/view_messages.h"
+ #include "content/public/browser/resource_dispatcher_host_delegate.h"
++#include "content/public/common/content_switches.h"
+ #include "content/public/common/resource_response.h"
+ #include "net/base/io_buffer.h"
+ #include "net/base/load_flags.h"
+@@ -53,9 +58,18 @@ void InitializeResourceBufferConstants() {
+     return;
+   did_init = true;
+ 
+-  GetNumericArg("resource-buffer-size", &kBufferSize);
+-  GetNumericArg("resource-buffer-min-allocation-size", &kMinAllocationSize);
+-  GetNumericArg("resource-buffer-max-allocation-size", &kMaxAllocationSize);
++  GetNumericArg(switches::kResourceBufferSize, &kBufferSize);
++  GetNumericArg(switches::kResourceBufferMinAllocationSize, &kMinAllocationSize);
++  GetNumericArg(switches::kResourceBufferMaxAllocationSize, &kMaxAllocationSize);
++
++  // ducalpha: for experiments
++  int maxAllocationPercent = 0;
++  GetNumericArg(switches::kResourceBufferMaxAllocationPercent, &maxAllocationPercent);
++  if (maxAllocationPercent > 0)
++    kMaxAllocationSize = kBufferSize * maxAllocationPercent / 100;
++
++  VLOG(1) << "resouce-buffer-size : " << kBufferSize << 
++      " and max-allocation-size : " << kMaxAllocationSize;
+ }
+ 
+ int CalcUsedPercentage(int bytes_read, int buffer_size) {
+@@ -63,6 +77,140 @@ int CalcUsedPercentage(int bytes_read, int buffer_size) {
+   return static_cast<int>(ratio * 100.0 + 0.5);  // Round to nearest integer.
+ }
+ 
++class BufferSizeManager {
++ public:
++  BufferSizeManager()
++    : buffer_size_(kBufferSize),
++      min_allocation_size_(kMinAllocationSize),
++      max_allocation_size_(kMaxAllocationSize),
++      buffer_size_multiplier_(kDefaultBufferSizeMultiplier),
++      last_bandwidth_kbps_(0.0) {
++  }
++
++  void IncreaseBufferSizeMultiplier() {
++    ++buffer_size_multiplier_;
++    TRACE_EVENT_INSTANT1("net", "IncreaseBufferSizeMultiplier",
++        TRACE_EVENT_SCOPE_THREAD,
++        "Buffer size multiplier", buffer_size_multiplier_);
++  }
++
++  int BufferSize() const {
++    return buffer_size_;
++  }
++
++  int MinAllocationSize() const {
++    return min_allocation_size_;
++  }
++
++  int MaxAllocationSize() const {
++    return max_allocation_size_;
++  }
++
++  void UpdateBufferSize(double current_bandwidth_kbps) {
++    // Each pending data count represents 1 block of max allocation size (at most)
++    // is waiting for the rendering process to consume
++    // Therefore, (average pending data count / buffer size multiplier) 
++    // estimates the average utilization of buffer
++    // (Both the count and multiplier are in terms of max allocation sizes)
++    double average_pending_data_count = AveragePendingDataCount();
++
++    if (average_pending_data_count >= 0) {
++      // Decrease buffer size multipler when the buffer is underused (less than 50%)
++      if (average_pending_data_count  < 0.5 * buffer_size_multiplier_) {
++        buffer_size_multiplier_ -= 1; // decreasing by 1 linearly may be fine
++        TRACE_EVENT_INSTANT1("net", "DecreaseBufferSizeMultiplier",
++            TRACE_EVENT_SCOPE_THREAD,
++            "Buffer size multiplier", buffer_size_multiplier_);
++      }
++
++      TRACE_EVENT_INSTANT2("net", "UpdateAveragePendingDataCount", 
++          TRACE_EVENT_SCOPE_THREAD,
++          "Average pending data count", average_pending_data_count, 
++          "BufferSizeMultiplier after update", buffer_size_multiplier_);
++    }
++
++    if (current_bandwidth_kbps > 0 &&
++        last_bandwidth_kbps_ != current_bandwidth_kbps) {
++      // Max allocation size should be a multiple of min allocation size
++      // See content/browser/loader/resource_buffer.cc
++      // Basically, I want 
++      //     max_allocation_size = current_bandwidth * min_allocation_size / k
++      // so that data will reside inside the buffer in at most 1/k seconds
++      // (Assume each time ResouceBuffer allocates max_allocation_size)
++      int size_multiplier = current_bandwidth_kbps / 8 * 1000 / min_allocation_size_;
++
++      if (size_multiplier == 0) {
++        // In case the bandwidth is too low
++        max_allocation_size_ = min_allocation_size_;
++      } else {
++        // Let data reside in the buffer at most 1/2 sec
++        max_allocation_size_ = std::min(kMaxMaxAllocationSize,
++            min_allocation_size_ / 2 * size_multiplier);
++      }
++
++      buffer_size_ = std::min(kMaxBufferSize,
++          buffer_size_multiplier_ * max_allocation_size_);
++
++      last_bandwidth_kbps_ = current_bandwidth_kbps;
++
++      TRACE_EVENT_INSTANT1("net", "Smoothed bandwidth",
++          TRACE_EVENT_SCOPE_THREAD,
++          "Current bandwidth ", current_bandwidth_kbps);
++      TRACE_EVENT_INSTANT2("net", "UpdateResourceBufferConstants",
++          TRACE_EVENT_SCOPE_THREAD,
++          "Max alloc size", max_allocation_size_,
++          "Buffer size", buffer_size_);
++    }
++  }
++
++  void SavePendingDataCount(int pending_data_count) {
++    pending_data_count_history_.SaveToBuffer(pending_data_count);
++  }
++
++ private:
++  // 10 samples may be fine
++  static const int kNumSamples = 10;
++  typedef cc::RingBuffer<int, kNumSamples> HistoryRingBufferType;
++
++  // return -1 if there is no data
++  double AveragePendingDataCount() {
++    int sum = 0, count = 0; // Don't use BufferSize() which returns the constant size
++    for (HistoryRingBufferType::Iterator it = pending_data_count_history_.End();
++        it; --it) {
++      sum += **it;
++      ++count;
++    }
++    return count == 0 ? -1 : (double) sum / count;
++  }
++
++  // Limit buffer size to 2 MB
++  static const int kMaxBufferSize = 2 * 1024 * 1024;
++
++  // Choose the max MaxAllocationSize = 1/2 buffer size
++  // so we have 2 allocations to use before the buffer is full
++  static const int kDefaultBufferSizeMultiplier = 2;
++  static const int kMaxMaxAllocationSize = 
++      kMaxBufferSize / kDefaultBufferSizeMultiplier;
++
++  int buffer_size_;
++  int min_allocation_size_;
++  int max_allocation_size_;
++
++  // A multiplier to get the buffer size from max allocation size
++  // buffer_size = max_allocation_size * multiplier
++  int buffer_size_multiplier_;
++
++  // Cache the last bandwith estimation (kbps)
++  double last_bandwidth_kbps_;
++
++  HistoryRingBufferType pending_data_count_history_;
++
++  DISALLOW_COPY_AND_ASSIGN(BufferSizeManager);
++};
++
++base::LazyInstance<BufferSizeManager> g_buffer_size_manager =
++    LAZY_INSTANCE_INITIALIZER;
++
+ }  // namespace
+ 
+ class DependentIOBuffer : public net::WrappedIOBuffer {
+@@ -246,6 +394,11 @@ bool AsyncResourceHandler::OnWillRead(scoped_refptr<net::IOBuffer>* buf,
+   UMA_HISTOGRAM_CUSTOM_COUNTS(
+       "Net.AsyncResourceHandler_SharedIOBuffer_Alloc",
+       *buf_size, 0, kMaxAllocationSize, 100);
++  TRACE_EVENT_INSTANT1("net",
++      "Net.AsyncResourceHandler_SharedIOBuffer_Alloc",
++        TRACE_EVENT_SCOPE_THREAD, 
++      "buf_size", *buf_size);
++
+   return true;
+ }
+ 
+@@ -267,6 +420,16 @@ bool AsyncResourceHandler::OnReadCompleted(int bytes_read, bool* defer) {
+   UMA_HISTOGRAM_PERCENTAGE(
+       "Net.AsyncResourceHandler_SharedIOBuffer_UsedPercentage",
+       CalcUsedPercentage(bytes_read, allocation_size_));
++  TRACE_EVENT_INSTANT1("net", 
++      "Net.AsyncResourceHandler_SharedIOBuffer_Used",
++       TRACE_EVENT_SCOPE_THREAD, 
++      "bytes_read", bytes_read);
++  TRACE_EVENT_INSTANT1("net",
++      "Net.AsyncResourceHandler_SharedIOBuffer_UsedPercentage",
++       TRACE_EVENT_SCOPE_THREAD, 
++      "percent",
++      CalcUsedPercentage(bytes_read, allocation_size_));
++
+ 
+   if (!sent_first_data_msg_) {
+     base::SharedMemoryHandle handle;
+@@ -290,8 +453,27 @@ bool AsyncResourceHandler::OnReadCompleted(int bytes_read, bool* defer) {
+   UMA_HISTOGRAM_CUSTOM_COUNTS(
+       "Net.AsyncResourceHandler_PendingDataCount",
+       pending_data_count_, 0, 100, 100);
++  TRACE_EVENT_INSTANT1("net",
++      "Net.AsyncResourceHandler_PendingDataCount",
++        TRACE_EVENT_SCOPE_THREAD, 
++      "pending_data_count",
++      pending_data_count_);
++
++  // Collect the pending data count even when Network aware processing is not activated
++  if (rdh_->NetworkAwareProcessingEnabled())
++    g_buffer_size_manager.Get().SavePendingDataCount(pending_data_count_);
+ 
+   if (!buffer_->CanAllocate()) {
++    TRACE_EVENT_INSTANT1("net",
++        "Net.AsyncResourceHandler_PendingDataCount_WhenFull",
++        TRACE_EVENT_SCOPE_THREAD, 
++        "pending_data_count",
++        pending_data_count_);
++
++    // Increase buffer size multiplier when being overused
++    if (rdh_->NetworkAwareProcessingEnabled())
++      g_buffer_size_manager.Get().IncreaseBufferSizeMultiplier();
++
+     UMA_HISTOGRAM_CUSTOM_COUNTS(
+         "Net.AsyncResourceHandler_PendingDataCount_WhenFull",
+         pending_data_count_, 0, 100, 100);
+@@ -333,8 +515,13 @@ void AsyncResourceHandler::OnResponseCompleted(
+   // WebURLLoaderImpl::OnCompletedRequest that routes this message to a WebCore
+   // ResourceHandleInternal which asserts on its state and crashes. By crashing
+   // when the message is sent, we should get better crash reports.
++
++// ducalpha: This check breaks my technique
++// Disable this may cause no etrace from the renderer, but browser still loads without this check
++#if 0 
+   CHECK(status.status() != net::URLRequestStatus::SUCCESS ||
+         sent_received_response_msg_);
++#endif
+ 
+   int error_code = status.error();
+   bool was_ignored_by_handler = info->WasIgnoredByHandler();
+@@ -380,6 +567,18 @@ bool AsyncResourceHandler::EnsureResourceBufferIsInitialized() {
+   }
+ 
+   buffer_ = new ResourceBuffer();
++
++  if (rdh_->NetworkAwareProcessingActivated()) {
++    BufferSizeManager& buffer_size_manager = g_buffer_size_manager.Get();
++
++    // Update buffer parameters then create new buffer
++    buffer_size_manager.UpdateBufferSize(metrics_.EstimatedBandwidthKbps());
++
++    return buffer_->Initialize(buffer_size_manager.BufferSize(),
++                               buffer_size_manager.MinAllocationSize(),
++                               buffer_size_manager.MaxAllocationSize());
++  }
++
+   return buffer_->Initialize(kBufferSize,
+                              kMinAllocationSize,
+                              kMaxAllocationSize);
+diff --git a/content/browser/loader/async_resource_handler.h b/content/browser/loader/async_resource_handler.h
+index 6842b19..fb6a781 100644
+--- a/content/browser/loader/async_resource_handler.h
++++ b/content/browser/loader/async_resource_handler.h
+@@ -8,6 +8,7 @@
+ #include <string>
+ 
+ #include "base/memory/ref_counted.h"
++#include "content/browser/loader/resource_bandwidth_metrics.h" // ducalpha
+ #include "content/browser/loader/resource_handler.h"
+ #include "content/browser/loader/resource_message_delegate.h"
+ #include "url/gurl.h"
+@@ -61,6 +62,9 @@ class AsyncResourceHandler : public ResourceHandler,
+   void ResumeIfDeferred();
+   void OnDefer();
+ 
++  // ducalpha
++  ScopedResourceBandwidthMetrics metrics_;
++
+   scoped_refptr<ResourceBuffer> buffer_;
+   ResourceDispatcherHostImpl* rdh_;
+ 
+diff --git a/content/browser/loader/buffered_resource_handler.cc b/content/browser/loader/buffered_resource_handler.cc
+index 8fb8c5d..4eb995d 100644
+--- a/content/browser/loader/buffered_resource_handler.cc
++++ b/content/browser/loader/buffered_resource_handler.cc
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include "base/bind.h"
++#include "base/debug/trace_event.h"
+ #include "base/logging.h"
+ #include "base/metrics/histogram.h"
+ #include "base/strings/string_util.h"
+@@ -88,6 +89,7 @@ BufferedResourceHandler::BufferedResourceHandler(
+       bytes_read_(0),
+       must_download_(false),
+       must_download_is_set_(false),
++      replayed_once_(false),
+       weak_ptr_factory_(this) {
+ }
+ 
+@@ -108,6 +110,9 @@ bool BufferedResourceHandler::OnResponseStarted(ResourceResponse* response,
+                                                 bool* defer) {
+   response_ = response;
+ 
++  if (host_->NetworkAwareProcessingEnabled())
++    metrics_.StartStream();
++
+   // TODO(darin): It is very odd to special-case 304 responses at this level.
+   // We do so only because the code always has, see r24977 and r29355.  The
+   // fact that 204 is no longer special-cased this way suggests that 304 need
+@@ -120,9 +125,25 @@ bool BufferedResourceHandler::OnResponseStarted(ResourceResponse* response,
+ 
+   if (!(response_->head.headers.get() &&
+         response_->head.headers->response_code() == 304)) {
+-    if (ShouldSniffContent()) {
+-      state_ = STATE_BUFFERING;
+-      return true;
++    // ducalpha
++    // Start buffering only when network aware processing is activated
++    // NetworkAwareProcessingEnabled() is precondition for NetworkAwareProcessingActivated()
++    // so need not to check it here
++    if (host_->NetworkAwareProcessingActivated()) {
++      ResourceType resource_type = GetRequestInfo()->GetResourceType();
++      // Do not block progressive processing on main frame and iframe
++      if (resource_type != ResourceType::RESOURCE_TYPE_MAIN_FRAME &&
++          resource_type != ResourceType::RESOURCE_TYPE_SUB_FRAME) {
++        state_ = STATE_BUFFERING;
++        return true;
++      }
++      TRACE_EVENT_INSTANT0("net", "BufferedResourceHandler, Receive main/sub frame",
++                           TRACE_EVENT_SCOPE_THREAD);
++    } else { // original
++      if (ShouldSniffContent()) {
++        state_ = STATE_BUFFERING;
++        return true;
++      }
+     }
+ 
+     if (response_->head.mime_type.empty()) {
+@@ -169,6 +190,9 @@ bool BufferedResourceHandler::OnWillRead(scoped_refptr<net::IOBuffer>* buf,
+ }
+ 
+ bool BufferedResourceHandler::OnReadCompleted(int bytes_read, bool* defer) {
++  if (host_->NetworkAwareProcessingEnabled() && bytes_read > 0)
++    metrics_.RecordBytes(bytes_read);
++
+   if (state_ == STATE_STREAMING)
+     return next_handler_->OnReadCompleted(bytes_read, defer);
+ 
+@@ -178,6 +202,24 @@ bool BufferedResourceHandler::OnReadCompleted(int bytes_read, bool* defer) {
+   if (!DetermineMimeType() && (bytes_read > 0))
+     return true;  // Needs more data, so keep buffering.
+ 
++  // ducalpha
++  // Continue buffering only if the network aware processing (NRP) is still activated
++  // This does not break if NRP is deactived in the middle
++  if (host_->NetworkAwareProcessingActivated()) {
++    VLOG(2) << "OnReadCompleted, bytes_read_: " << bytes_read_
++        << " and read_buffer_size_: " << read_buffer_size_;
++    if (bytes_read_ == read_buffer_size_) {
++      // given read_buffer_ from the next handler is full, process it
++      state_ = STATE_PROCESSING;
++      if (!ProcessResponse(defer))
++        return false;
++
++      // continue buffering after processing call
++      state_ = STATE_BUFFERING;
++    }
++    return true;
++  }
++
+   state_ = STATE_PROCESSING;
+   return ProcessResponse(defer);
+ }
+@@ -186,6 +228,20 @@ void BufferedResourceHandler::OnResponseCompleted(
+     const net::URLRequestStatus& status,
+     const std::string& security_info,
+     bool* defer) {
++  if (host_->NetworkAwareProcessingEnabled())
++    metrics_.StopStream();
++
++  // ducalpha: proccess the response if it has not been processed
++  // If we buffered the data, need to process it
++  // Don't use NetworkAwareProcessingActivated() here as it can be turned off during loading
++  // and will break buffering
++  if (host_->NetworkAwareProcessingEnabled()) {
++    if (state_ == STATE_BUFFERING) {
++      state_ = STATE_PROCESSING;
++      ProcessResponse(defer);
++    }
++  }
++
+   // Upon completion, act like a pass-through handler in case the downstream
+   // handler defers OnResponseCompleted.
+   state_ = STATE_STREAMING;
+@@ -194,6 +250,14 @@ void BufferedResourceHandler::OnResponseCompleted(
+ }
+ 
+ void BufferedResourceHandler::Resume() {
++  // ducalpha: allow resuming when state is buffering
++  if (host_->NetworkAwareProcessingEnabled() && state_ == STATE_BUFFERING) {
++    TRACE_EVENT_INSTANT0("net", "BufferedResourceHandler::Resume",
++        TRACE_EVENT_SCOPE_THREAD);
++    controller()->Resume();
++    return;
++  }
++
+   switch (state_) {
+     case STATE_BUFFERING:
+     case STATE_PROCESSING:
+@@ -238,8 +302,23 @@ bool BufferedResourceHandler::ProcessResponse(bool* defer) {
+ 
+   state_ = STATE_REPLAYING;
+ 
+-  if (!next_handler_->OnResponseStarted(response_.get(), defer))
+-    return false;
++  // ducalpha
++  // Don't use host_->NetworkAwareProcessingActivated() on the condition
++  // because it may break in-progressing loading
++  // Do replay if we already buffer the data
++  if (host_->NetworkAwareProcessingEnabled()) {
++    // Prevent calling OnResponseStarted more than once,
++    if (!replayed_once_) {
++      // Call OnResponseStarted on the next handler
++      if (!next_handler_->OnResponseStarted(response_.get(), defer))
++        return false;
++
++      replayed_once_ = true;
++    }
++  } else { // original
++    if (!next_handler_->OnResponseStarted(response_.get(), defer))
++      return false;
++  }
+ 
+   if (!read_buffer_.get()) {
+     state_ = STATE_STREAMING;
+diff --git a/content/browser/loader/buffered_resource_handler.h b/content/browser/loader/buffered_resource_handler.h
+index 0b6d698..5d1bfe7 100644
+--- a/content/browser/loader/buffered_resource_handler.h
++++ b/content/browser/loader/buffered_resource_handler.h
+@@ -10,6 +10,7 @@
+ 
+ #include "base/memory/weak_ptr.h"
+ #include "content/browser/loader/layered_resource_handler.h"
++#include "content/browser/loader/resource_bandwidth_metrics.h"
+ #include "content/public/browser/resource_controller.h"
+ 
+ namespace net {
+@@ -100,6 +101,13 @@ class BufferedResourceHandler
+   bool must_download_;
+   bool must_download_is_set_;
+ 
++  // ducalpha
++  // If we already replayed the data once
++  bool replayed_once_;
++
++  // For recording the bandwidth metrics
++  ScopedResourceBandwidthMetrics metrics_;
++
+   base::WeakPtrFactory<BufferedResourceHandler> weak_ptr_factory_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(BufferedResourceHandler);
+diff --git a/content/browser/loader/resource_bandwidth_metrics.cc b/content/browser/loader/resource_bandwidth_metrics.cc
+new file mode 100644
+index 0000000..949c960
+--- /dev/null
++++ b/content/browser/loader/resource_bandwidth_metrics.cc
+@@ -0,0 +1,136 @@
++// Copyright (c) 2011 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "base/lazy_instance.h"
++#include "content/browser/loader/resource_bandwidth_metrics.h"
++
++namespace {
++
++// ducalpha: Modified net/base/bandwidth_metrics.h
++// Remove tracking of multiple streams.
++// Support 1 stream and compute Exponential Moving Average estimation
++// Tracks statistics about the bandwidth metrics over time.
++// Example usage:
++//
++//   ResourceBandwidthMetrics tracker;
++//
++//   // When a stream is created
++//   tracker.StartStream();
++//
++//   // When data is transferred on any stream
++//   tracker.RecordSample(bytes);
++//
++//   // When the stream is finished
++//   tracker.StopStream();
++//
++// NOTE: This class is not thread safe.
++//
++class ResourceBandwidthMetrics {
++ public:
++  ResourceBandwidthMetrics()
++      : num_streams_in_progress_(0),
++        started_(false),
++        bytes_since_last_start_(0),
++        ewma_bandwidth_(0.0) {}
++
++  double EstimatedBandwidthKbps() const { return ewma_bandwidth_; }
++
++  // Reset counters when starting new stream
++  void StartStream() {
++    //if (++num_streams_in_progress_ == 1) ResetCounters();
++    if (!started_) {
++      ResetCounters();
++      started_ = true;
++    }
++  }
++
++  // Add a sample of the number of bytes read from the network into the tracker.
++  void RecordBytes(int bytes) {
++    bytes_since_last_start_ += static_cast<int64>(bytes);
++  }
++
++  // Do not call ComputeEwmaBandwidthKbps, 
++  // Just skip the remaining of the stream
++  void StopStream() {
++    //if (--num_streams_in_progress_ < 0) num_streams_in_progress_ = 0;
++    ComputeEwmaBandwidthKbps();
++  }
++
++ private:
++  void ComputeEwmaBandwidthKbps() {
++    // Wait until the received bytes is more than 20 KB or passed 100 ms 
++    // before computing the bandwidth
++    static const int64 kRecordSizeThreshold = 20 * 1024;
++    TRACE_EVENT_INSTANT1("net", "ComputeEwmaBandwidthKbps_1",
++        TRACE_EVENT_SCOPE_THREAD, "Bytes since last start", bytes_since_last_start_); 
++    if (bytes_since_last_start_ < kRecordSizeThreshold)
++      return;
++
++    static const double min_duration_ms = 100;
++    base::TimeDelta delta = base::TimeTicks::HighResNow() - last_start_;
++    double ms = delta.InMillisecondsF();
++    TRACE_EVENT_INSTANT1("net", "ComputeEwmaBandwidthKbps_2",
++        TRACE_EVENT_SCOPE_THREAD, "Time since last start", ms);
++    // Skip too short durations
++    if (ms < min_duration_ms) {
++      return;
++    }
++
++    double kbps = static_cast<double>(bytes_since_last_start_) * 8 / ms;
++    ewma_bandwidth_ = 0.3 * kbps + 0.7 * ewma_bandwidth_;
++    TRACE_EVENT_INSTANT2("net", "ComputeEwmaBandwidthKbps_3",
++        TRACE_EVENT_SCOPE_THREAD, 
++        "Bandwidth", kbps, "Ewma bandwidth", EstimatedBandwidthKbps());
++    
++    // Reset counters
++    ResetCounters();
++  }
++
++  void ResetCounters() {
++    last_start_ = base::TimeTicks::HighResNow();
++    bytes_since_last_start_ = 0;
++  }
++
++  int num_streams_in_progress_;
++  bool started_;
++  int64 bytes_since_last_start_;  // Bytes tracked during this "session".
++  base::TimeTicks last_start_;    // Timestamp of the begin of this "session".
++  double ewma_bandwidth_; // EWMA bandwidth with alpha = 0.3
++};
++
++base::LazyInstance<ResourceBandwidthMetrics> 
++    g_resource_bandwidth_metrics = LAZY_INSTANCE_INITIALIZER;
++
++}  // namespace
++
++namespace content {
++
++ScopedResourceBandwidthMetrics::ScopedResourceBandwidthMetrics()
++    : started_(false) {
++}
++
++ScopedResourceBandwidthMetrics::~ScopedResourceBandwidthMetrics() {
++  if (started_)
++    g_resource_bandwidth_metrics.Get().StopStream();
++}
++
++void ScopedResourceBandwidthMetrics::StartStream() {
++  started_ = true;
++  g_resource_bandwidth_metrics.Get().StartStream();
++}
++
++void ScopedResourceBandwidthMetrics::StopStream() {
++  started_ = false;
++  g_resource_bandwidth_metrics.Get().StopStream();
++}
++
++void ScopedResourceBandwidthMetrics::RecordBytes(int bytes) {
++  g_resource_bandwidth_metrics.Get().RecordBytes(bytes);
++}
++
++double ScopedResourceBandwidthMetrics::EstimatedBandwidthKbps() {
++  return g_resource_bandwidth_metrics.Get().EstimatedBandwidthKbps();
++}
++
++}  // namespace content
+diff --git a/content/browser/loader/resource_bandwidth_metrics.h b/content/browser/loader/resource_bandwidth_metrics.h
+new file mode 100644
+index 0000000..56cab86
+--- /dev/null
++++ b/content/browser/loader/resource_bandwidth_metrics.h
+@@ -0,0 +1,31 @@
++// Copyright (c) 2011 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_LOADER_RESOURCE_BANDWIDTH_METRICS_H_
++#define CONTENT_BROWSER_LOADER_RESOURCE_BANDWIDTH_METRICS_H_
++
++#include "base/debug/trace_event.h"
++#include "base/time/time.h"
++
++namespace content {
++
++// A utility class for managing the lifecycle of a measured stream.
++// It is important that we not leave unclosed streams, and this class helps
++// ensure we always stop them.
++class ScopedResourceBandwidthMetrics {
++ public:
++  ScopedResourceBandwidthMetrics();
++  ~ScopedResourceBandwidthMetrics();
++  void StartStream();
++  void StopStream();
++
++  void RecordBytes(int bytes);
++  double EstimatedBandwidthKbps();
++ private:
++  bool started_;
++};
++
++}  // namespace content 
++
++#endif  // CONTENT_BROWSER_LOADER_RESOURCE_BANDWIDTH_METRICS_H_
+diff --git a/content/browser/loader/resource_dispatcher_host_impl.cc b/content/browser/loader/resource_dispatcher_host_impl.cc
+index f63b7cf..2fb1321 100644
+--- a/content/browser/loader/resource_dispatcher_host_impl.cc
++++ b/content/browser/loader/resource_dispatcher_host_impl.cc
+@@ -344,6 +344,14 @@ ResourceDispatcherHostImpl::ResourceDispatcherHostImpl()
+ 
+   update_load_states_timer_.reset(
+       new base::RepeatingTimer<ResourceDispatcherHostImpl>());
++
++  // ducalpha
++  const base::CommandLine& cmdline = *CommandLine::ForCurrentProcess();
++  network_aware_processing_enabled_ =
++          cmdline.HasSwitch(switches::kEnableNetworkAwareProcessing);
++
++  // Activate at the beginning if enabled
++  network_aware_processing_activated_ = network_aware_processing_enabled_;
+ }
+ 
+ ResourceDispatcherHostImpl::~ResourceDispatcherHostImpl() {
+@@ -2003,4 +2011,9 @@ int ResourceDispatcherHostImpl::BuildLoadFlagsForRequest(
+   return load_flags;
+ }
+ 
++void ResourceDispatcherHostImpl::SetNetworkAwareProcessingActivation(bool activated) {
++  if (network_aware_processing_enabled_)
++    network_aware_processing_activated_ = activated;
++}
++
+ }  // namespace content
+diff --git a/content/browser/loader/resource_dispatcher_host_impl.h b/content/browser/loader/resource_dispatcher_host_impl.h
+index 269af92..4f83d13 100644
+--- a/content/browser/loader/resource_dispatcher_host_impl.h
++++ b/content/browser/loader/resource_dispatcher_host_impl.h
+@@ -244,6 +244,18 @@ class CONTENT_EXPORT ResourceDispatcherHostImpl
+                          scoped_refptr<ResourceRequestBody> request_body,
+                          int64 frame_node_id);
+ 
++
++  // ducalpha
++  void SetNetworkAwareProcessingActivation(bool activated);
++
++  bool NetworkAwareProcessingEnabled() const {
++    return network_aware_processing_enabled_;
++  }
++
++  bool NetworkAwareProcessingActivated() const {
++    return network_aware_processing_activated_;
++  }
++
+  private:
+   friend class ResourceDispatcherHostTest;
+ 
+@@ -517,6 +529,14 @@ class CONTENT_EXPORT ResourceDispatcherHostImpl
+ 
+   scoped_ptr<ResourceScheduler> scheduler_;
+ 
++  // ducalpha
++  // This flag is statically set from the command line
++  // If this is false, all methods related to network aware processing have no effect 
++  bool network_aware_processing_enabled_;
++
++  // This flag can be set on run-time
++  bool network_aware_processing_activated_;
++
+   DISALLOW_COPY_AND_ASSIGN(ResourceDispatcherHostImpl);
+ };
+ 
+diff --git a/content/content_browser.gypi b/content/content_browser.gypi
+index 84ff880..740fd7e 100644
+--- a/content/content_browser.gypi
++++ b/content/content_browser.gypi
+@@ -788,6 +788,8 @@
+       'browser/loader/power_save_block_resource_throttle.h',
+       'browser/loader/redirect_to_file_resource_handler.cc',
+       'browser/loader/redirect_to_file_resource_handler.h',
++      'browser/loader/resource_bandwidth_metrics.cc',
++      'browser/loader/resource_bandwidth_metrics.h',
+       'browser/loader/resource_buffer.cc',
+       'browser/loader/resource_buffer.h',
+       'browser/loader/resource_dispatcher_host_impl.cc',
+diff --git a/content/public/common/content_switches.cc b/content/public/common/content_switches.cc
+index fcc7027..6bd6515 100644
+--- a/content/public/common/content_switches.cc
++++ b/content/public/common/content_switches.cc
+@@ -390,6 +390,9 @@ const char kEnableLogging[]                 = "enable-logging";
+ // Enables the memory benchmarking extension
+ const char kEnableMemoryBenchmarking[]      = "enable-memory-benchmarking";
+ 
++// Enables Network-aware Resource Processing (NRP) technique
++const char kEnableNetworkAwareProcessing[]  = "enable-network-aware-processing";
++
+ // Enables the network information API.
+ const char kEnableNetworkInformation[]      = "enable-network-information";
+ 
+@@ -702,6 +705,18 @@ const char kRendererProcessLimit[]          = "renderer-process-limit";
+ // Causes the renderer process to display a dialog on launch.
+ const char kRendererStartupDialog[]         = "renderer-startup-dialog";
+ 
++// Async resource handler's resource buffer size
++const char kResourceBufferSize[]            = "resource-buffer-size";
++
++// Resource buffer's min allocation size
++const char kResourceBufferMinAllocationSize[] = "resource-buffer-min-allocation-size";
++
++// Async resource handler's resource buffer percent
++const char kResourceBufferMaxAllocationPercent[] = "resource-buffer-max-allocation-percent";
++
++// Resource buffer's max allocation size
++const char kResourceBufferMaxAllocationSize[] = "resource-buffer-max-allocation-size";
++
+ // Causes the process to run as a sandbox IPC subprocess.
+ const char kSandboxIPCProcess[]             = "sandbox-ipc";
+ 
+diff --git a/content/public/common/content_switches.h b/content/public/common/content_switches.h
+index 8704a5b..a555ac9 100644
+--- a/content/public/common/content_switches.h
++++ b/content/public/common/content_switches.h
+@@ -114,6 +114,7 @@ CONTENT_EXPORT extern const char kEnableInbandTextTracks[];
+ CONTENT_EXPORT extern const char kEnableLCDText[];
+ CONTENT_EXPORT extern const char kEnableLogging[];
+ extern const char kEnableMemoryBenchmarking[];
++CONTENT_EXPORT extern const char kEnableNetworkAwareProcessing[];
+ CONTENT_EXPORT extern const char kEnableNetworkInformation[];
+ CONTENT_EXPORT extern const char kEnableOneCopy[];
+ CONTENT_EXPORT extern const char kEnableOverlayFullscreenVideo[];
+@@ -198,6 +199,10 @@ extern const char kRendererCmdPrefix[];
+ CONTENT_EXPORT extern const char kRendererProcess[];
+ CONTENT_EXPORT extern const char kRendererProcessLimit[];
+ CONTENT_EXPORT extern const char kRendererStartupDialog[];
++CONTENT_EXPORT extern const char kResourceBufferSize[];
++CONTENT_EXPORT extern const char kResourceBufferMinAllocationSize[];
++CONTENT_EXPORT extern const char kResourceBufferMaxAllocationPercent[];
++CONTENT_EXPORT extern const char kResourceBufferMaxAllocationSize[];
+ extern const char kSandboxIPCProcess[];
+ CONTENT_EXPORT extern const char kScrollEndEffect[];
+ extern const char kShowPaintRects[];

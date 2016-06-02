@@ -1,0 +1,1020 @@
+diff --git a/base/assisted_scheduling/assisted_scheduler.cc b/base/assisted_scheduling/assisted_scheduler.cc
+new file mode 100644
+index 0000000..ab47dd9
+--- /dev/null
++++ b/base/assisted_scheduling/assisted_scheduler.cc
+@@ -0,0 +1,163 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($DUC_LICENSE_URL)
++
++
++#ifndef BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_g
++#define BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_g
++
++#include "base/assisted_scheduling/assisted_scheduler.h"
++
++#include "base/assisted_scheduling/qos_monitor.h"
++#include "base/base_switches.h"
++#include "base/command_line.h"
++#include "base/memory/singleton.h"
++#include "base/threading/thread_id_name_manager.h"
++
++namespace base {
++
++// static
++AssistedScheduler* AssistedScheduler::GetInstance() {
++  return Singleton<AssistedScheduler>::get();
++}
++
++AssistedScheduler::AssistedScheduler()
++  : mode_(kMode_Default) {
++  enabled_ = CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAssistedScheduling);
++
++  // Create and populate cpu info only if needed
++  if (enabled_) {
++    SetActivation(true);
++  }
++}
++
++void AssistedScheduler::SetActivation(bool activated) {
++  if (!enabled_)
++    return;
++
++  // Do not check duplicated activated to enforce mode regardless of activated_
++  // Also, the SetMode already check duplicated mode
++  activated_ = activated;
++
++  SetMode(activated ? kMode_EnergySaving : kMode_Default);
++}
++
++bool AssistedScheduler::CheckQosAndSchedule() {
++  if (!enabled_ || !activated_)
++    return false;
++
++  Mode new_mode = base::QosMonitor::GetInstance()->IsQosSatisfied() ?
++                    kMode_EnergySaving : kMode_Default;
++
++  return SetMode(new_mode);
++}
++
++void AssistedScheduler::RegisterThread(PlatformThreadId tid) {
++  if (!enabled_)
++    return;
++
++  VLOG(0) << "AssistedScheduler::RegisterThread " <<
++      ThreadIdNameManager::GetInstance()->GetName(tid);
++
++  // Still register thread if enabled_
++  bool inserted = managed_threads_.insert(tid).second;
++
++  // Not set thread affinity when not activated
++  if (!activated_)
++    return;
++
++  // If the thread is inserted, schedule it to the appropriate cores
++  if (inserted) {
++    PlatformThread::SetThreadAffinity(tid, CoresForMode(mode_));
++  } else {
++    LOG(WARNING) << "Thread is already registered";
++  }
++}
++
++void AssistedScheduler::SynchronizeMode(Mode mode) {
++  if (!enabled_ || !activated_)
++    return;
++
++  SetMode(mode);
++}
++
++bool AssistedScheduler::SetMode(Mode new_mode) { 
++  if (new_mode == mode_)
++    return false;
++
++  VLOG(0) << "Set to mode " << new_mode;
++
++  SetManagedThreadsClusterAffinity(new_mode);
++  mode_ = new_mode;
++  return true;
++}
++
++std::vector<size_t> AssistedScheduler::CoresForMode(Mode mode) {
++#if defined(USE_CPU_INFO)
++  // Assume the cluster infos are sorted by energy
++  // So the first is the most energy saving, the last is performanced-maximized
++  std::vector<CpuClusterInfo> cluster_info = cpu_info_->ClusterInfos();
++  size_t min_core_id = 0, max_core_id = 0;
++  switch (mode) {
++    case kMode_EnergySaving:
++      min_core_id = cluster_info.front().min_core_id;
++      max_core_id = cluster_info.front().max_core_id;
++      break;
++    case kMode_MaximumPerformance:
++      min_core_id = cluster_info.back().min_core_id;
++      max_core_id = cluster_info.back().max_core_id;
++      break;
++    case kMode_Default:
++      min_core_id = cpu_info_->MinCoreId();
++      max_core_id = cpu_info_->MaxCoreId();
++      break;
++    default:
++      NOTREACHED();
++      min_core_id = cpu_info_->MinCoreId();
++      max_core_id = cpu_info_->MaxCoreId();
++  }
++#else
++  // TODO: remove hard coded core ids
++  // Use hard coded core ids to remove dependency to android_cpu_tools library
++  // Assume G900H device
++  size_t min_core_id = 0, max_core_id = 7;
++  switch (mode) {
++    case kMode_EnergySaving:
++      min_core_id = 0;
++      max_core_id = 3;
++      break;
++    case kMode_MaximumPerformance:
++      min_core_id = 4;
++      max_core_id = 7;
++      break;
++    case kMode_Default:
++      min_core_id = 0;
++      max_core_id = 7;
++      break;
++    default:
++      NOTREACHED();
++  }
++#endif
++
++  std::vector<size_t> result(max_core_id - min_core_id + 1);
++
++  // TODO: change to std::iota in C++11
++  for (size_t i = min_core_id; i <= max_core_id; ++i) {
++    result[i - min_core_id] = i;
++  }
++
++  return result;
++}
++
++void AssistedScheduler::SetManagedThreadsClusterAffinity(Mode mode) {
++  std::vector<size_t> eligible_cores = CoresForMode(mode);
++
++  for (ManagedThreadSetType::iterator it = managed_threads_.begin();
++       it != managed_threads_.end();
++       ++it) {
++    PlatformThread::SetThreadAffinity(*it, eligible_cores);
++  }
++}
++    
++}  // namespace base
++
++#endif  // BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_g
+diff --git a/base/assisted_scheduling/assisted_scheduler.h b/base/assisted_scheduling/assisted_scheduler.h
+new file mode 100644
+index 0000000..fc9dd60
+--- /dev/null
++++ b/base/assisted_scheduling/assisted_scheduler.h
+@@ -0,0 +1,79 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($LICENSE_URL)
++
++#ifndef BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_
++#define BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_
++
++#include <set>
++
++#include "base/macros.h"
++#include "base/threading/platform_thread.h"
++#include "base/time/time.h"
++
++namespace base {
++
++class BASE_EXPORT AssistedScheduler {
++ public:
++  // Get the singleton instance for the current process
++  static AssistedScheduler* GetInstance();
++
++  AssistedScheduler();
++
++  // Enable/disable the scheduler on run-time
++  void SetActivation(bool activated);
++
++  // Check the QoS, and change to other mode if necessary
++  // Return true if current mode changed
++  bool CheckQosAndSchedule();
++
++  // Register a thread to be managed by this scheduler
++  // The calling thread's affinity is also set accordingly
++  void RegisterThread(PlatformThreadId tid);
++
++  // Assisted scheduler modes
++  // TODO change to enum class when using C++11
++  enum Mode {
++    kMode_Default, // managed threads on any cores
++    kMode_EnergySaving, // managed threads on little cores
++    kMode_MaximumPerformance // managed threads on big cores
++  };
++
++  // Hacky way to synchronize mode between renderer and browser is to
++  // send an IPC and call this method
++  // TODO: current IPC is sent via cc where Qos Check is call,
++  // need to refactor to send IPC between AssistedScheduler instances
++  void SynchronizeMode(Mode mode);
++
++  // Return current mode
++  Mode GetMode() const {
++    return mode_;
++  }
++
++ private:
++  // Set current mode and scheduler threads accordingly
++  // Return true if current mode changed
++  bool SetMode(Mode mode);
++
++  // Return the core ids (e.g., {0,1,2,3}) for a mode
++  std::vector<size_t> CoresForMode(Mode mode);
++
++  // Move managed threads to a cpu cluster
++  void SetManagedThreadsClusterAffinity(Mode mode);
++
++  // Current mode
++  Mode mode_;
++
++  typedef std::set<PlatformThreadId> ManagedThreadSetType;
++  ManagedThreadSetType managed_threads_;
++
++  // If this is false, public methods have no effect
++  // This flag is set by command line, is the pre-condition for activated_
++  bool enabled_;
++
++  // This flag can be set on the fly
++  bool activated_;
++
++  DISALLOW_COPY_AND_ASSIGN(AssistedScheduler);
++};
++}  // namespace base
++#endif  // BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_
+diff --git a/base/assisted_scheduling/qos_monitor.cc b/base/assisted_scheduling/qos_monitor.cc
+new file mode 100644
+index 0000000..987a1ac
+--- /dev/null
++++ b/base/assisted_scheduling/qos_monitor.cc
+@@ -0,0 +1,160 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($LICENSE_URL)
++
++#include "base/assisted_scheduling/qos_monitor.h"
++#include "base/base_switches.h"
++#include "base/command_line.h"
++#include "base/debug/trace_event.h"
++#include "base/logging.h"
++#include "base/memory/singleton.h"
++#include "base/threading/platform_thread.h"
++#include "content/public/common/content_switches.h"
++
++#define MILLIS_IN_SEC 1000
++
++namespace {
++
++// 10 fps = 100 ms responsiveness
++const size_t kDefaultRequiredFps = 10;
++
++}  // namespace
++
++namespace base {
++
++// static
++QosMonitor* QosMonitor::GetInstance() {
++  return Singleton<QosMonitor>::get();
++}
++
++QosMonitor::QosMonitor()
++  : qos_just_changed_(true),
++    required_fps_(kDefaultRequiredFps) {
++  bool is_on_renderer_process = 
++       base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII(switches::kProcessType) 
++         == switches::kRendererProcess;  
++
++  // Although QoS monitor may work independently, it binds to AssistedScheduler for now
++  // since the AssistedScheduler is the only its user
++  // Also, Qos monitor is enabled on renderer process only
++  // because the QoS is the frame rate of rendering the web page, not the UI on the browser process   
++  enabled_ = is_on_renderer_process &&
++      CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAssistedScheduling);
++}
++
++void QosMonitor::SaveFrameBeginTime(base::TimeTicks timestamp) {
++  if (!enabled_)
++    return;
++
++  if (frame_begin_time_history_.BufferSize() > 2) {
++    VLOG(1) << base::PlatformThread::GetName() << " drew a frame in " 
++        << RecentFrameInterval(frame_begin_time_history_.BufferSize() - 1).InMilliseconds() << " ms";
++  }
++
++  frame_begin_time_history_.SaveToBuffer(timestamp);
++}
++
++// Compute number of QoS violation in 1 second
++// and compare with tolerable QoS violations
++// Return true if the number of QoS violation is in the tolerable range
++bool QosMonitor::IsQosSatisfied() {
++  // Not enough samples
++  if (!enabled_ || frame_begin_time_history_.CurrentIndex() < 2)
++    return true;
++
++  base::TimeTicks most_recent_frame_time = 
++      frame_begin_time_history_.ReadBuffer(frame_begin_time_history_.BufferSize() - 1);
++  base::TimeTicks least_recent_frame_time =
++      frame_begin_time_history_.ReadBuffer(frame_begin_time_history_.Begin().index());
++
++  // Not enough samples
++  // Assume and checked (kQosSatisfactionWindowMs < kQosViolationWindowMs)
++  base::TimeDelta delta = most_recent_frame_time - least_recent_frame_time; 
++  /*VLOG(1) << "most recent frame time: " << most_recent_frame_time.ToInternalValue()
++    << ", least recent frame time: " << least_recent_frame_time.ToInternalValue()
++    << ", delta: " << delta.InMilliseconds();*/
++  if (delta.InMilliseconds() < kQosViolationWindowMs)
++    return true;
++
++  int frame_count = 0;
++  RingBufferType::Iterator it = frame_begin_time_history_.End();
++  // Count number of frames in the last qos_satisaction window
++  for (; it; --it) {
++    delta = most_recent_frame_time - frame_begin_time_history_.ReadBuffer(it.index()); 
++
++    VLOG(2) << "Delta: " << delta.InMilliseconds();
++
++    if (delta.InMilliseconds() > kQosSatisfactionWindowMs)
++      break;
++
++    ++frame_count;
++  }
++
++  // Can adjust the following to make the keeping on EnergySavingMode
++  // more or less conservative
++  size_t qos_satisfaction_minimum_frames_per_sec = required_fps_;
++  size_t qos_violation_minimum_frames_per_sec = required_fps_;
++
++  int qos_satifaction_frame_count =
++        delta.InMilliseconds() * qos_satisfaction_minimum_frames_per_sec / MILLIS_IN_SEC;
++  VLOG(1) << "Frame count: " << frame_count << " qos satisfaction frame count: " << qos_satifaction_frame_count;
++
++  // Tolerance 10%, sometimes, frame counting sometimes misses some frames
++  const int tolerance = 10;
++  if (frame_count >= (100 - tolerance) * qos_satifaction_frame_count / 100)
++    return true;
++
++  // Countinue to count number of frames in the last qos_violation window 
++  for (; it; --it) {
++    delta = most_recent_frame_time - frame_begin_time_history_.ReadBuffer(it.index()); 
++
++    VLOG(2) << "Delta: " << delta.InMilliseconds();
++
++    if (delta.InMilliseconds() > kQosViolationWindowMs)
++      break;
++
++    ++frame_count;
++  }
++
++  int qos_violation_frame_count =
++        delta.InMilliseconds() * qos_violation_minimum_frames_per_sec / MILLIS_IN_SEC;
++  VLOG(1) << "Frame count: " << frame_count << " qos violation frame count: " << qos_violation_frame_count;
++
++  if (frame_count < (100 - tolerance) * qos_violation_frame_count / 100) {
++    VLOG(1) << "QoS violated!";
++    return false;
++  }
++
++  return true;
++}
++
++void QosMonitor::SetRequiredFps(size_t required_fps) {
++  if (!enabled_ || required_fps_ == required_fps)
++    return;
++
++  required_fps_ = required_fps;
++
++  VLOG(1) << "Required fps changes to " << required_fps;
++
++  // Clear fps history to prevent noise from previous policy
++  ClearHistory("Required fps changed");
++}
++
++void QosMonitor::ClearHistory(const std::string& reason) {
++  if (!enabled_)
++    return;
++      
++  // Clear frame begin time history when required_fps changes
++  VLOG(1) << "QosMonitor::ClearHistory because of " << reason;
++  TRACE_EVENT1("cc", "FrameRateCounter::RequiredFpsChanged",
++               "reason", reason);
++
++  frame_begin_time_history_.Clear();
++}
++
++base::TimeDelta QosMonitor::RecentFrameInterval(size_t n) const {
++  DCHECK_GT(n, 0u);
++  DCHECK_LT(n, frame_begin_time_history_.BufferSize());
++  return frame_begin_time_history_.ReadBuffer(n) - frame_begin_time_history_.ReadBuffer(n - 1);
++}
++
++}  // namespace base
+diff --git a/base/assisted_scheduling/qos_monitor.h b/base/assisted_scheduling/qos_monitor.h
+new file mode 100644
+index 0000000..266e852
+--- /dev/null
++++ b/base/assisted_scheduling/qos_monitor.h
+@@ -0,0 +1,59 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($LICENSE_URL)
++
++#ifndef BASE_ASSISTED_SCHEDULING_QOS_MONITOR_H_
++#define BASE_ASSISTED_SCHEDULING_QOS_MONITOR_H_
++
++#include <string>
++
++#include "base/macros.h"
++#include "base/time/time.h"
++// FIXME: refactor to remove dependency on cc's ring buffer
++#include "cc/debug/ring_buffer.h"
++
++namespace base {
++
++class BASE_EXPORT QosMonitor {
++ public:
++  // Get singleton of Qos monitor for the current process
++  static QosMonitor* GetInstance();
++
++  QosMonitor();
++
++  void SaveFrameBeginTime(base::TimeTicks timestamp);
++
++  // Compute number of QoS violation in 1 second
++  // and compare with tolerable QoS violations
++  // Return true if the number of QoS violation is in the tolerable range
++  bool IsQosSatisfied();
++
++  // Change the required fps
++  void SetRequiredFps(size_t required_fps);
++
++  // Clear history of Qos monitor since the history is no longer valid
++  // (E.g., when renderer resumes painting after some time)
++  // TODO: add more information to history to distinguish cases
++  void ClearHistory(const std::string& reason);
++
++ private:
++  TimeDelta RecentFrameInterval(size_t n) const;
++
++  static const int kQosViolationWindowMs = 3000;
++  static const int kQosSatisfactionWindowMs = 1000;
++
++  // 180 frames = 3 sec of 60 fps
++  typedef cc::RingBuffer<base::TimeTicks, 180> RingBufferType;
++
++  RingBufferType frame_begin_time_history_;
++
++  bool qos_just_changed_;
++
++  size_t required_fps_;
++
++  bool enabled_;
++
++  DISALLOW_COPY_AND_ASSIGN(QosMonitor);
++};
++
++}  // namespace base
++#endif  // BASE_ASSISTED_SCHEDULING_QOS_MONITOR_H_
+diff --git a/base/base.gypi b/base/base.gypi
+index cfa9d61..a478939 100644
+--- a/base/base.gypi
++++ b/base/base.gypi
+@@ -13,6 +13,8 @@
+       ['base_target==1', {
+         'sources': [
+           '../build/build_config.h',
++          'third_party/cpu_info/cpu_info_switches.h',
++          'third_party/cpu_info/cpu_info_switches.cc',
+           'third_party/dmg_fp/dmg_fp.h',
+           'third_party/dmg_fp/g_fmt.cc',
+           'third_party/dmg_fp/dtoa_wrapper.cc',
+@@ -74,6 +76,10 @@
+           'android/thread_utils.h',
+           'android/trace_event_binding.cc',
+           'android/trace_event_binding.h',
++          'assisted_scheduling/assisted_scheduler.cc',
++          'assisted_scheduling/assisted_scheduler.h',
++          'assisted_scheduling/qos_monitor.cc',
++          'assisted_scheduling/qos_monitor.h',
+           'at_exit.cc',
+           'at_exit.h',
+           'atomic_ref_count.h',
+@@ -602,6 +608,7 @@
+           'threading/non_thread_safe_impl.h',
+           'threading/platform_thread.h',
+           'threading/platform_thread_android.cc',
++          'threading/platform_thread_assisted_scheduling_android.cc',
+           'threading/platform_thread_linux.cc',
+           'threading/platform_thread_mac.mm',
+           'threading/platform_thread_posix.cc',
+diff --git a/base/base_switches.cc b/base/base_switches.cc
+index 9582ac9..6b886ee 100644
+--- a/base/base_switches.cc
++++ b/base/base_switches.cc
+@@ -47,6 +47,9 @@ const char kVModule[]                       = "vmodule";
+ // Will wait for 60 seconds for a debugger to come to attach to the process.
+ const char kWaitForDebugger[]               = "wait-for-debugger";
+ 
++// Enable Application-Assisted Scheduling
++extern const char kEnableAssistedScheduling[] = "enable-assisted-scheduling";
++
+ // Sends a pretty-printed version of tracing info to the console.
+ const char kTraceToConsole[]                = "trace-to-console";
+ 
+diff --git a/base/base_switches.h b/base/base_switches.h
+index ba995d5..b75dab5 100644
+--- a/base/base_switches.h
++++ b/base/base_switches.h
+@@ -24,6 +24,9 @@ extern const char kV[];
+ extern const char kVModule[];
+ extern const char kWaitForDebugger[];
+ 
++// ducalpha
++extern const char kEnableAssistedScheduling[];
++
+ #if defined(OS_POSIX)
+ extern const char kEnableCrashReporterForTesting[];
+ #endif
+diff --git a/base/third_party/cpu_info/cpu_info_switches.cc b/base/third_party/cpu_info/cpu_info_switches.cc
+new file mode 100644
+index 0000000..ca0a0db
+--- /dev/null
++++ b/base/third_party/cpu_info/cpu_info_switches.cc
+@@ -0,0 +1,18 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($DUC_LICENSE_URL)
++
++#include "base/third_party/cpu_info/cpu_info_switches.h"
++
++namespace android_tools {
++namespace switches {
++
++const char kCpuCoreIds[] = "cpu-core-ids";
++
++const char kClusterCoreIds[] = "cluster-core-ids";
++
++const char kClusterFreqs[] = "cluster-freqs";
++
++const char kClusterFreqGovernors[] = "cluster-freq-governors";
++
++}  // namespace switches
++}  // namespace android_tools
+diff --git a/base/third_party/cpu_info/cpu_info_switches.h b/base/third_party/cpu_info/cpu_info_switches.h
+new file mode 100644
+index 0000000..b5af4d3
+--- /dev/null
++++ b/base/third_party/cpu_info/cpu_info_switches.h
+@@ -0,0 +1,21 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($DUC_LICENSE_URL)
++
++#ifndef ANDROID_TOOLS_CPU_INFO_CPU_INFO_SWITCHES_H_
++#define ANDROID_TOOLS_CPU_INFO_CPU_INFO_SWITCHES_H_
++
++namespace android_tools {
++namespace switches {
++
++extern const char kCpuCoreIds[];
++
++extern const char kClusterCoreIds[];
++
++extern const char kClusterFreqs[];
++
++extern const char kClusterFreqGovernors[];
++
++}  // namespace switches
++}  // namespace android_tools
++
++#endif // ANDROID_TOOLS_CPU_INFO_CPU_INFO_SWITCHES_H_
+diff --git a/base/threading/platform_thread.h b/base/threading/platform_thread.h
+index 2874314..7378003 100644
+--- a/base/threading/platform_thread.h
++++ b/base/threading/platform_thread.h
+@@ -20,6 +20,7 @@
+ #include <pthread.h>
+ #include <unistd.h>
+ #endif
++#include <vector>
+ 
+ namespace base {
+ 
+@@ -121,6 +122,14 @@ enum ThreadPriority{
+   kThreadPriority_Background
+ };
+ 
++// Valid values for SetThreadClusterAffinity
++// TODO: change to enum class when using C++11 (e.g., v51)
++enum CpuCluster {
++  kCpuCluster_All,
++  kCpuCluster_Little,
++  kCpuCluster_Big
++};
++
+ // A namespace for low-level thread functions.
+ class BASE_EXPORT PlatformThread {
+  public:
+@@ -191,6 +200,15 @@ class BASE_EXPORT PlatformThread {
+   static void SetThreadPriority(PlatformThreadHandle handle,
+                                 ThreadPriority priority);
+ 
++  // ducalpha: the following are used by the Assisted Scheduling
++  // Set the current thread to run on certain cpu cores
++  static void SetCurrentThreadAffinity(const std::vector<size_t>& eligible_core_ids);
++
++  // Set a thread to run on certain cpus
++  // Return false in case of failure (e.g., the caller does not have permission)
++  // Use this when you know exact the cores you want to pin the thread to
++  static bool SetThreadAffinity(PlatformThreadId tid, const std::vector<size_t>& eligible_core_ids);
++
+  private:
+   DISALLOW_IMPLICIT_CONSTRUCTORS(PlatformThread);
+ };
+diff --git a/base/threading/platform_thread_assisted_scheduling_android.cc b/base/threading/platform_thread_assisted_scheduling_android.cc
+new file mode 100644
+index 0000000..8a40b58
+--- /dev/null
++++ b/base/threading/platform_thread_assisted_scheduling_android.cc
+@@ -0,0 +1,97 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($LICENSE_URL)
++
++#include "base/logging.h"
++#include "base/threading/platform_thread.h"
++
++// For debugging
++#include "base/threading/thread_id_name_manager.h"
++#include <sstream>
++
++#if !defined(_GNU_SOURCE)
++#define _GNU_SOURCE
++#endif
++
++#include <asm/unistd.h>
++#include <sched.h>
++#include <set>
++#include <string>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++// Before android-21, ndk not have sched_setaffinity, CPU_ZERO and CPU_SET
++#if !defined(CPU_ZERO) 
++// The following macros are copied from android-21 sched.h
++#ifdef __LP64__
++#define CPU_SETSIZE 1024
++#else
++#define CPU_SETSIZE 32
++#endif
++
++#define __CPU_BITTYPE  unsigned long int  /* mandated by the kernel  */
++#define __CPU_BITS     (8 * sizeof(__CPU_BITTYPE))
++#define __CPU_ELT(x)   ((x) / __CPU_BITS)
++#define __CPU_MASK(x)  ((__CPU_BITTYPE)1 << ((x) & (__CPU_BITS - 1)))
++
++typedef struct {
++  __CPU_BITTYPE  __bits[ CPU_SETSIZE / __CPU_BITS ];
++} cpu_set_t;
++
++#define CPU_ZERO(set)          CPU_ZERO_S(sizeof(cpu_set_t), set)
++#define CPU_SET(cpu, set)      CPU_SET_S(cpu, sizeof(cpu_set_t), set)
++
++#define CPU_ZERO_S(setsize, set)  __builtin_memset(set, 0, setsize)
++
++#define CPU_SET_S(cpu, setsize, set) \
++  do { \
++    size_t __cpu = (cpu); \
++    if (__cpu < 8 * (setsize)) \
++      (set)->__bits[__CPU_ELT(__cpu)] |= __CPU_MASK(__cpu); \
++  } while (0)
++
++
++namespace {
++
++int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
++  // bionic actually uses Assembly code for this
++  return syscall(__NR_sched_setaffinity, pid, cpusetsize, mask);
++}
++
++}  // namespace
++
++#endif // !defined(CPU_ZERO)
++
++namespace base {
++
++void PlatformThread::SetCurrentThreadAffinity(const std::vector<size_t>& eligible_core_ids) {
++  if (!SetThreadAffinity(0, eligible_core_ids)) {
++    LOG(ERROR) << "Set current thread affinity failed";
++  }
++}
++
++bool PlatformThread::SetThreadAffinity(PlatformThreadId tid,
++                                       const std::vector<size_t>& eligible_core_ids) {
++  cpu_set_t mask;
++  CPU_ZERO(&mask);
++
++  std::ostringstream debug_message;
++  debug_message << "PlatformThread::SetThreadAffinity for thread " <<
++      ThreadIdNameManager::GetInstance()->GetName(tid) << " to cores: ";
++
++  for (size_t i = 0; i < eligible_core_ids.size(); ++i) {
++    CPU_SET(eligible_core_ids[i], &mask);
++    debug_message << eligible_core_ids[i] << " ";
++  }
++  
++  VLOG(0) << debug_message.str();
++
++  // There is no pthread_setaffinity_np in ndk yet
++  if (sched_setaffinity(tid, sizeof(mask), &mask) < 0) {
++      PLOG(ERROR) << "sched_setaffinity failed";
++      return false;
++  }
++  return true;
++}
++
++}  // namespace base
++
+diff --git a/cc/output/output_surface.h b/cc/output/output_surface.h
+index f3a874a..8bd6db8 100644
+--- a/cc/output/output_surface.h
++++ b/cc/output/output_surface.h
+@@ -7,6 +7,7 @@
+ 
+ #include <deque>
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h"
+ #include "base/basictypes.h"
+ #include "base/memory/ref_counted.h"
+ #include "base/memory/scoped_ptr.h"
+@@ -136,6 +137,10 @@ class CC_EXPORT OutputSurface {
+     return overlay_candidate_validator_.get();
+   }
+ 
++  // ducalpha
++  // Send an IPC to browser process to synchronize assisted scheduler's mode on renderer
++  virtual void SynchronizeAssistedSchedulerMode(base::AssistedScheduler::Mode mode) {}
++
+  protected:
+   OutputSurfaceClient* client_;
+ 
+diff --git a/cc/resources/raster_worker_pool.cc b/cc/resources/raster_worker_pool.cc
+index d01bdc8..5286c98d 100644
+--- a/cc/resources/raster_worker_pool.cc
++++ b/cc/resources/raster_worker_pool.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <algorithm>
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h" // ducalpha
+ #include "base/atomic_sequence_num.h"
+ #include "base/debug/trace_event_synthetic_delay.h"
+ #include "base/lazy_instance.h"
+@@ -43,6 +44,8 @@ class RasterTaskGraphRunner : public TaskGraphRunner,
+       worker->Start();
+ #if defined(OS_ANDROID) || defined(OS_LINUX)
+       worker->SetThreadPriority(base::kThreadPriority_Background);
++      // ducalpha
++      base::AssistedScheduler::GetInstance()->RegisterThread(worker->tid()); 
+ #endif
+       workers_.push_back(worker.Pass());
+     }
+diff --git a/cc/trees/layer_tree_host_impl.cc b/cc/trees/layer_tree_host_impl.cc
+index 3ae833b..902a643 100644
+--- a/cc/trees/layer_tree_host_impl.cc
++++ b/cc/trees/layer_tree_host_impl.cc
+@@ -7,6 +7,8 @@
+ #include <algorithm>
+ #include <limits>
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h"
++#include "base/assisted_scheduling/qos_monitor.h"
+ #include "base/basictypes.h"
+ #include "base/containers/hash_tables.h"
+ #include "base/debug/trace_event_argument.h"
+@@ -1509,6 +1511,10 @@ void LayerTreeHostImpl::DrawLayers(FrameData* frame,
+ 
+   fps_counter_->SaveTimeStamp(frame_begin_time,
+                               !output_surface_->context_provider());
++
++  // ducalpha: record the frame_begin_time, near fps_counter_
++  base::QosMonitor::GetInstance()->SaveFrameBeginTime(frame_begin_time);
++
+   bool on_main_thread = false;
+   rendering_stats_instrumentation_->IncrementFrameCount(
+       1, on_main_thread);
+@@ -1670,6 +1676,15 @@ bool LayerTreeHostImpl::SwapBuffers(const LayerTreeHostImpl::FrameData& frame) {
+         "SwapBuffers");
+   }
+   renderer_->SwapBuffers(metadata);
++
++  // ducalpha: decide the assisted scheduler mode
++  // after swapping buffers to avoid additional delay to paiting
++  base::AssistedScheduler* assisted_scheduler = base::AssistedScheduler::GetInstance();
++  if (assisted_scheduler->CheckQosAndSchedule()) {
++    // TODO: use output_surface to send IPC between process (very hacky)
++    output_surface_->SynchronizeAssistedSchedulerMode(assisted_scheduler->GetMode());
++  }
++
+   return true;
+ }
+ 
+diff --git a/content/app/content_main_runner.cc b/content/app/content_main_runner.cc
+index e9aebce..b31f50e 100644
+--- a/content/app/content_main_runner.cc
++++ b/content/app/content_main_runner.cc
+@@ -7,6 +7,7 @@
+ #include <stdlib.h>
+ 
+ #include "base/allocator/allocator_extension.h"
++#include "base/assisted_scheduling/assisted_scheduler.h"
+ #include "base/at_exit.h"
+ #include "base/command_line.h"
+ #include "base/debug/debugger.h"
+@@ -26,6 +27,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/stringprintf.h"
++#include "base/base_switches.h"
+ #include "content/browser/browser_main.h"
+ #include "content/common/set_process_title.h"
+ #include "content/common/url_schemes.h"
+diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
+index 516af83..15e0f1d 100644
+--- a/content/browser/renderer_host/render_process_host_impl.cc
++++ b/content/browser/renderer_host/render_process_host_impl.cc
+@@ -1126,6 +1126,7 @@ void RenderProcessHostImpl::PropagateBrowserCommandLineToRenderer(
+     switches::kDomAutomationController,
+     switches::kEnableAcceleratedFixedRootBackground,
+     switches::kEnableAcceleratedOverflowScroll,
++    switches::kEnableAssistedScheduling,
+     switches::kEnableBeginFrameScheduling,
+     switches::kEnableBleedingEdgeRenderingFastPaths,
+     switches::kEnableCompositingForFixedPosition,
+diff --git a/content/browser/renderer_host/render_widget_host_view_android.cc b/content/browser/renderer_host/render_widget_host_view_android.cc
+index 49ae253..8a27ee5 100644
+--- a/content/browser/renderer_host/render_widget_host_view_android.cc
++++ b/content/browser/renderer_host/render_widget_host_view_android.cc
+@@ -281,6 +281,8 @@ bool RenderWidgetHostViewAndroid::OnMessageReceived(
+                         OnSetNeedsBeginFrame)
+     IPC_MESSAGE_HANDLER(ViewHostMsg_SmartClipDataExtracted,
+                         OnSmartClipDataExtracted)
++    IPC_MESSAGE_HANDLER(ViewHostMsg_SynchronizeAssistedSchedulerMode,
++                        OnSynchronizeAssistedSchedulerMode)
+     IPC_MESSAGE_UNHANDLED(handled = false)
+   IPC_END_MESSAGE_MAP()
+   return handled;
+@@ -504,6 +506,12 @@ void RenderWidgetHostViewAndroid::SetTextSurroundingSelectionCallback(
+   text_surrounding_selection_callback_ = callback;
+ }
+ 
++void RenderWidgetHostViewAndroid::OnSynchronizeAssistedSchedulerMode(
++    base::AssistedScheduler::Mode mode) {
++  VLOG(1) << "On Synchronize Assisted Scheduler Mode: " << mode;
++  base::AssistedScheduler::GetInstance()->SynchronizeMode(mode);
++}
++
+ void RenderWidgetHostViewAndroid::OnTextSurroundingSelectionResponse(
+     const base::string16& content,
+     size_t start_offset,
+diff --git a/content/browser/renderer_host/render_widget_host_view_android.h b/content/browser/renderer_host/render_widget_host_view_android.h
+index 6f5963b..f8b2a21 100644
+--- a/content/browser/renderer_host/render_widget_host_view_android.h
++++ b/content/browser/renderer_host/render_widget_host_view_android.h
+@@ -8,6 +8,7 @@
+ #include <map>
+ #include <queue>
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h"
+ #include "base/callback.h"
+ #include "base/compiler_specific.h"
+ #include "base/i18n/rtl.h"
+@@ -246,6 +247,9 @@ class CONTENT_EXPORT RenderWidgetHostViewAndroid
+   void SetTextSurroundingSelectionCallback(
+       const TextSurroundingSelectionCallback& callback);
+ 
++  // ducalpha: a hacky way to synchronize mode of schedulers on different processes
++  void OnSynchronizeAssistedSchedulerMode(base::AssistedScheduler::Mode mode);
++
+  private:
+   // TouchSelectionControllerClient implementation.
+   virtual bool SupportsAnimation() const OVERRIDE;
+diff --git a/content/common/view_messages.h b/content/common/view_messages.h
+index 4497d50..928251e 100644
+--- a/content/common/view_messages.h
++++ b/content/common/view_messages.h
+@@ -5,6 +5,7 @@
+ // IPC messages for page rendering.
+ // Multiply-included message file, hence no include guard.
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h"
+ #include "base/memory/shared_memory.h"
+ #include "base/process/process.h"
+ #include "base/strings/string16.h"
+@@ -68,6 +69,7 @@
+ 
+ #define IPC_MESSAGE_START ViewMsgStart
+ 
++IPC_ENUM_TRAITS(base::AssistedScheduler::Mode)
+ IPC_ENUM_TRAITS(blink::WebMediaPlayerAction::Type)
+ IPC_ENUM_TRAITS(blink::WebPluginAction::Type)
+ IPC_ENUM_TRAITS(blink::WebPopupType)
+@@ -1643,6 +1645,11 @@ IPC_MESSAGE_CONTROL3(ViewHostMsg_RunWebAudioMediaCodec,
+ IPC_MESSAGE_ROUTED1(ViewHostMsg_SetNeedsBeginFrame,
+                     bool /* enabled */)
+ 
++// Sent by renderer to synchronize mode of AssistedScheduler on Browser to Renderer
++// E.g., energy saving -> maximum performance
++IPC_MESSAGE_ROUTED1(ViewHostMsg_SynchronizeAssistedSchedulerMode,
++                    base::AssistedScheduler::Mode /* mode */)
++
+ // Reply to the ViewMsg_ExtractSmartClipData message.
+ IPC_MESSAGE_ROUTED3(ViewHostMsg_SmartClipDataExtracted,
+                     base::string16 /* text */,
+diff --git a/content/renderer/gpu/compositor_output_surface.cc b/content/renderer/gpu/compositor_output_surface.cc
+index bc89848..d5badf1 100644
+--- a/content/renderer/gpu/compositor_output_surface.cc
++++ b/content/renderer/gpu/compositor_output_surface.cc
+@@ -4,6 +4,7 @@
+ 
+ #include "content/renderer/gpu/compositor_output_surface.h"
+ 
++#include "base/assisted_scheduling/qos_monitor.h"
+ #include "base/command_line.h"
+ #include "base/message_loop/message_loop_proxy.h"
+ #include "cc/output/compositor_frame.h"
+@@ -223,6 +224,15 @@ void CompositorOutputSurface::OnUpdateVSyncParametersFromBrowser(
+ #if defined(OS_ANDROID)
+ void CompositorOutputSurface::SetNeedsBeginFrame(bool enable) {
+   DCHECK(CalledOnValidThread());
++
++  // ducalpha
++  // Typicall renderer SetNeedsBeginFrame false->true->false->true
++  // Clear the history when resuming painting after some period
++  // This prevents QosMonitor to see low fps after renderer stops painting for some amount of time
++  if (enable) {
++    base::QosMonitor::GetInstance()->ClearHistory("Begin painting new frames");
++  }
++
+   Send(new ViewHostMsg_SetNeedsBeginFrame(routing_id_, enable));
+ }
+ 
+@@ -297,4 +307,9 @@ void CompositorOutputSurface::UpdateSmoothnessTakesPriority(
+   prefers_smoothness_ = prefers_smoothness;
+ }
+ 
++void CompositorOutputSurface::SynchronizeAssistedSchedulerMode(base::AssistedScheduler::Mode mode) {
++  DCHECK(CalledOnValidThread());
++  Send(new ViewHostMsg_SynchronizeAssistedSchedulerMode(routing_id_, mode));
++}
++
+ }  // namespace content
+diff --git a/content/renderer/gpu/compositor_output_surface.h b/content/renderer/gpu/compositor_output_surface.h
+index 0b369b2..516e211 100644
+--- a/content/renderer/gpu/compositor_output_surface.h
++++ b/content/renderer/gpu/compositor_output_surface.h
+@@ -5,6 +5,7 @@
+ #ifndef CONTENT_RENDERER_GPU_COMPOSITOR_OUTPUT_SURFACE_H_
+ #define CONTENT_RENDERER_GPU_COMPOSITOR_OUTPUT_SURFACE_H_
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h"
+ #include "base/basictypes.h"
+ #include "base/compiler_specific.h"
+ #include "base/memory/ref_counted.h"
+@@ -66,6 +67,9 @@ class CompositorOutputSurface
+   // int CompositorThread after it is fully refactored (http://crbug/170828)
+   virtual void UpdateSmoothnessTakesPriority(bool prefer_smoothness) OVERRIDE;
+ 
++  // ducalpha
++  virtual void SynchronizeAssistedSchedulerMode(base::AssistedScheduler::Mode mode) OVERRIDE;
++
+  protected:
+   void ShortcutSwapAck(uint32 output_surface_id,
+                        scoped_ptr<cc::GLFrameData> gl_frame_data,
+diff --git a/gpu/command_buffer/service/async_pixel_transfer_manager_egl.cc b/gpu/command_buffer/service/async_pixel_transfer_manager_egl.cc
+index e153617..c08aeae 100644
+--- a/gpu/command_buffer/service/async_pixel_transfer_manager_egl.cc
++++ b/gpu/command_buffer/service/async_pixel_transfer_manager_egl.cc
+@@ -7,6 +7,7 @@
+ #include <list>
+ #include <string>
+ 
++#include "base/assisted_scheduling/assisted_scheduler.h" // ducalpha
+ #include "base/bind.h"
+ #include "base/debug/trace_event.h"
+ #include "base/debug/trace_event_synthetic_delay.h"
+@@ -91,6 +92,9 @@ class TransferThread : public base::Thread {
+     Start();
+ #if defined(OS_ANDROID) || defined(OS_LINUX)
+     SetPriority(base::kThreadPriority_Background);
++
++    // ducalpha
++    base::AssistedScheduler::GetInstance()->RegisterThread(thread_id());
+ #endif
+   }
+   virtual ~TransferThread() {

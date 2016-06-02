@@ -1,0 +1,469 @@
+diff --git a/content/browser/android/content_view_core_impl.cc b/content/browser/android/content_view_core_impl.cc
+index c84e2b2..f9be278 100644
+--- a/content/browser/android/content_view_core_impl.cc
++++ b/content/browser/android/content_view_core_impl.cc
+@@ -1470,6 +1470,11 @@ void ContentViewCoreImpl::SetBackgroundOpaque(JNIEnv* env, jobject jobj,
+     GetRenderWidgetHostViewAndroid()->SetBackgroundOpaque(opaque);
+ }
+ 
++// ducalpha
++void ContentViewCoreImpl::SetEnergySavingActivation(JNIEnv* env, jobject jobj, jboolean activated) {
++  web_contents_->SetEnergySavingActivation(activated, true);
++}
++
+ void ContentViewCoreImpl::RequestTextSurroundingSelection(
+     int max_length,
+     const base::Callback<
+@@ -1509,6 +1514,24 @@ void ContentViewCoreImpl::WebContentsDestroyed() {
+   wcva->SetContentViewCore(NULL);
+ }
+ 
++// ducalpha
++void ContentViewCoreImpl::SetAdaptivePaintingActivation(bool activated, bool caused_by_user_interaction) {
++  // Set activation for both ContentViewCore (java) and WindowAndroid
++  // For ContentViewCore: stop activating/deactivating the WindowAndroid
++  // (Set first to prevent it change WindowAndroid activation when this function is running)
++  // (The order may not be important as settings these flags is on the single UI thread)
++  // For WindowAndroid: stop throttling VSyncs
++  JNIEnv* env = AttachCurrentThread();
++  ScopedJavaLocalRef<jobject> j_obj = java_ref_.get(env);
++  if (!j_obj.is_null() && !caused_by_user_interaction)
++    Java_ContentViewCore_setDynamicEnergySavingActivation(
++        env, j_obj.obj(), activated);
++
++  window_android_->SetAdaptivePaintingActivation(activated);
++  if (!activated)
++    window_android_->RequestVSyncUpdate(); // to get the VSync immediately when deactivating
++}
++
+ // This is called for each ContentView.
+ jlong Init(JNIEnv* env,
+            jobject obj,
+diff --git a/content/browser/android/content_view_core_impl.h b/content/browser/android/content_view_core_impl.h
+index a389d46..81111de 100644
+--- a/content/browser/android/content_view_core_impl.h
++++ b/content/browser/android/content_view_core_impl.h
+@@ -202,6 +202,9 @@ class ContentViewCoreImpl : public ContentViewCore,
+ 
+   void SetBackgroundOpaque(JNIEnv* env, jobject jobj, jboolean opaque);
+ 
++  // ducalpha
++  void SetEnergySavingActivation(JNIEnv* env, jobject jobj, jboolean activated);
++
+   jint GetCurrentRenderProcessId(JNIEnv* env, jobject obj);
+ 
+   // --------------------------------------------------------------------------
+@@ -300,6 +303,11 @@ class ContentViewCoreImpl : public ContentViewCore,
+   void SelectBetweenCoordinates(const gfx::PointF& start,
+                                 const gfx::PointF& end);
+ 
++  // ducalpha
++  // Activate/deactive the adaptive content painting on Java layer and on WindowAndroid
++  // If caused by user interaction, do not call the ContentViewCore java which originally caused this call
++  void SetAdaptivePaintingActivation(bool activated, bool caused_by_user_interaction);
++
+  private:
+   class ContentViewUserData;
+ 
+diff --git a/content/browser/loader/resource_dispatcher_host_impl.cc b/content/browser/loader/resource_dispatcher_host_impl.cc
+index 2fb1321..a7787eb 100644
+--- a/content/browser/loader/resource_dispatcher_host_impl.cc
++++ b/content/browser/loader/resource_dispatcher_host_impl.cc
+@@ -2014,6 +2014,7 @@ int ResourceDispatcherHostImpl::BuildLoadFlagsForRequest(
+ void ResourceDispatcherHostImpl::SetNetworkAwareProcessingActivation(bool activated) {
+   if (network_aware_processing_enabled_)
+     network_aware_processing_activated_ = activated;
++  VLOG(1) << "ResourceDispatcherHostImpl::SetNetworkAwareProcessingActivation " << activated;
+ }
+ 
+ }  // namespace content
+diff --git a/content/browser/web_contents/web_contents_impl.cc b/content/browser/web_contents/web_contents_impl.cc
+index f7770e5..6b393e0 100644
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <utility>
+ 
++#include "base/base_switches.h"
+ #include "base/command_line.h"
+ #include "base/debug/trace_event.h"
+ #include "base/lazy_instance.h"
+@@ -50,6 +51,7 @@
+ #include "content/browser/screen_orientation/screen_orientation_dispatcher_host.h"
+ #include "content/browser/site_instance_impl.h"
+ #include "content/browser/web_contents/web_contents_view_guest.h"
++#include "content/browser/web_contents/web_contents_view_android.h"
+ #include "content/browser/webui/generic_handler.h"
+ #include "content/browser/webui/web_ui_controller_factory_registry.h"
+ #include "content/browser/webui/web_ui_impl.h"
+@@ -95,6 +97,7 @@
+ #include "net/url_request/url_request_context.h"
+ #include "net/url_request/url_request_context_getter.h"
+ #include "ui/base/layout.h"
++#include "ui/base/ui_base_switches.h"
+ #include "ui/gfx/display.h"
+ #include "ui/gfx/screen.h"
+ #include "ui/gl/gl_switches.h"
+@@ -382,6 +385,12 @@ WebContentsImpl::WebContentsImpl(
+   frame_tree_.SetFrameRemoveListener(
+       base::Bind(&WebContentsImpl::OnFrameRemoved,
+                  base::Unretained(this)));
++
++  // ducalpha: assume there are only 3 techniques by now
++  disable_dynamic_energy_saving_activation_ =
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableNetworkAwareProcessing) &&
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAdaptivePainting) &&
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAssistedScheduling);
+ }
+ 
+ WebContentsImpl::~WebContentsImpl() {
+@@ -2699,7 +2708,13 @@ void WebContentsImpl::OnDidFinishLoad(
+       WebContentsObserver, observers_, DidFinishLoad(rfh, validated_url));
+ }
+ 
+-void WebContentsImpl::OnDidStartLoading(bool to_different_document) {
++void WebContentsImpl::OnDidStartLoading(bool to_different_document,
++                                        bool energy_saving_activated) {
++  // ducalpha
++  if (energy_saving_activated) {
++    SetEnergySavingActivation(true, false);
++  }
++
+   RenderFrameHostImpl* rfh =
+       static_cast<RenderFrameHostImpl*>(render_frame_message_source_);
+   int64 render_frame_id = rfh->frame_tree_node()->frame_tree_node_id();
+@@ -3698,6 +3713,11 @@ void WebContentsImpl::DocumentOnLoadCompleted(
+       NOTIFICATION_LOAD_COMPLETED_MAIN_FRAME,
+       Source<WebContents>(this),
+       NotificationService::NoDetails());
++
++  VLOG(1) << "Browser: Page load finishes";
++  // Deactive the energy saving after DocumentOnLoadCompletedInMainFrame
++  // which may make BrowserProfiler restart the browser
++  SetEnergySavingActivation(false, false);
+ }
+ 
+ void WebContentsImpl::UpdateTitle(RenderFrameHost* render_frame_host,
+@@ -4253,4 +4273,32 @@ void WebContentsImpl::ResumeResponseDeferredAtStart() {
+   node->render_manager()->ResumeResponseDeferredAtStart();
+ }
+ 
++void WebContentsImpl::SetEnergySavingActivation(bool activated, bool caused_by_user_interaction) {
++  if (disable_dynamic_energy_saving_activation_ || activated == energy_saving_activated_)
++    return;
++
++  energy_saving_activated_ = activated;
++
++  std::string debug_message = "Browser, ";
++  debug_message += activated ? "activate" : "deactivate";
++  debug_message += " energy saving techniques, is ";
++  debug_message += is_loading_ ? "" : "not ";
++  debug_message += "loading";
++  VLOG(0) << debug_message;
++
++  ResourceDispatcherHostImpl* rdh = ResourceDispatcherHostImpl::Get();
++  if (rdh) { // NULL in unittests.
++    rdh->SetNetworkAwareProcessingActivation(activated);
++  }
++
++  base::AssistedScheduler::GetInstance()->SetActivation(activated);
++
++#if defined(OS_ANDROID)
++  WebContentsViewAndroid* web_contents_view_android = (WebContentsViewAndroid*) GetView();
++  if (web_contents_view_android) {
++    web_contents_view_android->SetAdaptivePaintingActivation(activated, caused_by_user_interaction);
++  }
++#endif
++}
++
+ }  // namespace content
+diff --git a/content/browser/web_contents/web_contents_impl.h b/content/browser/web_contents/web_contents_impl.h
+index 1d83cfc..7aae92d 100644
+--- a/content/browser/web_contents/web_contents_impl.h
++++ b/content/browser/web_contents/web_contents_impl.h
+@@ -671,6 +671,10 @@ class CONTENT_EXPORT WebContentsImpl
+   // immediately at first response).
+   void ResumeResponseDeferredAtStart();
+ 
++  // ducalpha
++  // Activate/deactivate energy saving techniques on the fly
++  void SetEnergySavingActivation(bool activated, bool caused_by_user_interaction);
++
+  private:
+   friend class TestNavigationObserver;
+   friend class WebContentsAddedObserver;
+@@ -753,7 +757,7 @@ class CONTENT_EXPORT WebContentsImpl
+                                const GURL& target_url);
+   void OnDocumentLoadedInFrame();
+   void OnDidFinishLoad(const GURL& url);
+-  void OnDidStartLoading(bool to_different_document);
++  void OnDidStartLoading(bool to_different_document, bool energy_saving_activated);
+   void OnDidStopLoading();
+   void OnDidChangeLoadProgress(double load_progress);
+   void OnGoToEntryAtOffset(int offset);
+@@ -1203,6 +1207,13 @@ class CONTENT_EXPORT WebContentsImpl
+   // is created, and broadcast to all frames when it changes.
+   AccessibilityMode accessibility_mode_;
+ 
++  // Whether we activate/deactivate energy saving techniques at page load time
++  // and user interaction or not
++  bool disable_dynamic_energy_saving_activation_;
++
++  // Is performing energy saving techniques or not
++  bool energy_saving_activated_;
++
+   DISALLOW_COPY_AND_ASSIGN(WebContentsImpl);
+ };
+ 
+diff --git a/content/browser/web_contents/web_contents_view_android.cc b/content/browser/web_contents/web_contents_view_android.cc
+index 3378595..3e433ad 100644
+--- a/content/browser/web_contents/web_contents_view_android.cc
++++ b/content/browser/web_contents/web_contents_view_android.cc
+@@ -208,4 +208,9 @@ void WebContentsViewAndroid::TakeFocus(bool reverse) {
+   web_contents_->GetRenderWidgetHostView()->Focus();
+ }
+ 
++void WebContentsViewAndroid::SetAdaptivePaintingActivation(bool activated, bool caused_by_user_interaction) {
++  if (content_view_core_)
++    content_view_core_->SetAdaptivePaintingActivation(activated, caused_by_user_interaction);
++}
++
+ } // namespace content
+diff --git a/content/browser/web_contents/web_contents_view_android.h b/content/browser/web_contents/web_contents_view_android.h
+index 2503595..462e9dd 100644
+--- a/content/browser/web_contents/web_contents_view_android.h
++++ b/content/browser/web_contents/web_contents_view_android.h
+@@ -72,6 +72,9 @@ class WebContentsViewAndroid : public WebContentsView,
+   virtual void GotFocus() OVERRIDE;
+   virtual void TakeFocus(bool reverse) OVERRIDE;
+ 
++  // ducalpha
++  void SetAdaptivePaintingActivation(bool activated, bool caused_by_user_interaction);
++
+  private:
+   // The WebContents whose contents we display.
+   WebContentsImpl* web_contents_;
+diff --git a/content/common/frame_messages.h b/content/common/frame_messages.h
+index 93fba85..5de1a60 100644
+--- a/content/common/frame_messages.h
++++ b/content/common/frame_messages.h
+@@ -509,8 +509,9 @@ IPC_MESSAGE_ROUTED3(FrameHostMsg_DidFailLoadWithError,
+ // Sent when the renderer starts loading the page. |to_different_document| will
+ // be true unless the load is a fragment navigation, or triggered by
+ // history.pushState/replaceState.
+-IPC_MESSAGE_ROUTED1(FrameHostMsg_DidStartLoading,
+-                    bool /* to_different_document */)
++IPC_MESSAGE_ROUTED2(FrameHostMsg_DidStartLoading,
++                    bool /* to_different_document */,
++                    bool /* energy_saving_activated */)
+ 
+ // Sent when the renderer is done loading a page.
+ IPC_MESSAGE_ROUTED0(FrameHostMsg_DidStopLoading)
+diff --git a/content/public/android/java/src/org/chromium/content/browser/ContentViewCore.java b/content/public/android/java/src/org/chromium/content/browser/ContentViewCore.java
+index 58f66b4..7a42677 100644
+--- a/content/public/android/java/src/org/chromium/content/browser/ContentViewCore.java
++++ b/content/public/android/java/src/org/chromium/content/browser/ContentViewCore.java
+@@ -352,6 +352,10 @@ public class ContentViewCore
+     // screen orientation.
+     private boolean mFullscreenRequiredForOrientationLock = true;
+ 
++    // ducalpha
++    // Whether the adaptive content painting is activated/deactivated on user interaction
++    boolean mDynamicEnergySavingActivation = false;
++
+     /**
+      * Constructs a new ContentViewCore. Embedders must call initialize() after constructing
+      * a ContentViewCore and before using it.
+@@ -1303,6 +1307,28 @@ public class ContentViewCore
+     }
+ 
+     void updateGestureStateListener(int gestureType) {
++        // ducalpha
++        // To reduce user experience degradation:
++        // Disable energy saving on user gestures
++        // Enable energy saving when user gestures end
++        if (mDynamicEnergySavingActivation) {
++            switch (gestureType) {
++                case GestureEventType.SCROLL_START:
++                case GestureEventType.PINCH_BEGIN:
++                case GestureEventType.FLING_START:
++                case GestureEventType.TAP_DOWN:
++                    setEnergySavingActivation(false);
++                    break;
++                case GestureEventType.TAP_CANCEL:
++                case GestureEventType.SCROLL_END:
++                case GestureEventType.PINCH_END:
++                case GestureEventType.FLING_CANCEL:
++                case GestureEventType.FLING_END:
++                    setEnergySavingActivation(true);
++                    break;
++            }
++        }
++
+         for (mGestureStateListenersIterator.rewind();
+                 mGestureStateListenersIterator.hasNext();) {
+             GestureStateListener listener = mGestureStateListenersIterator.next();
+@@ -3114,6 +3140,18 @@ public class ContentViewCore
+         return mFullscreenRequiredForOrientationLock;
+     }
+ 
++    // ducalpha
++    @CalledByNative
++    private void setDynamicEnergySavingActivation(boolean activated) {
++        mDynamicEnergySavingActivation = activated;
++    }
++
++    private void setEnergySavingActivation(boolean activated) {
++        if (mNativeContentViewCore != 0) {
++            nativeSetEnergySavingActivation(mNativeContentViewCore, activated);
++        }
++    }
++
+     private native WebContents nativeGetWebContentsAndroid(long nativeContentViewCoreImpl);
+ 
+     private native void nativeOnJavaContentViewCoreDestroyed(long nativeContentViewCoreImpl);
+@@ -3246,4 +3284,7 @@ public class ContentViewCore
+             int x, int y, int w, int h);
+ 
+     private native void nativeSetBackgroundOpaque(long nativeContentViewCoreImpl, boolean opaque);
++
++    // ducalpha
++    private native void nativeSetEnergySavingActivation(long nativeContentViewCoreImpl, boolean activated);
+ }
+diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
+index 66bd21c..38f71e0 100644
+--- a/content/renderer/render_frame_impl.cc
++++ b/content/renderer/render_frame_impl.cc
+@@ -8,6 +8,7 @@
+ #include <string>
+ 
+ #include "base/auto_reset.h"
++#include "base/base_switches.h"
+ #include "base/command_line.h"
+ #include "base/debug/alias.h"
+ #include "base/debug/asan_invalid_access.h"
+@@ -118,6 +119,7 @@
+ #include "third_party/WebKit/public/web/WebSurroundingText.h"
+ #include "third_party/WebKit/public/web/WebUserGestureIndicator.h"
+ #include "third_party/WebKit/public/web/WebView.h"
++#include "ui/base/ui_base_switches.h"
+ 
+ #if defined(ENABLE_PLUGINS)
+ #include "content/renderer/npapi/webplugin_impl.h"
+@@ -453,6 +455,7 @@ RenderFrameImpl::RenderFrameImpl(RenderViewImpl* render_view, int routing_id)
+       screen_orientation_dispatcher_(NULL),
+       accessibility_mode_(AccessibilityModeOff),
+       renderer_accessibility_(NULL),
++      energy_saving_activated_(false),
+       weak_factory_(this) {
+   std::pair<RoutingIDFrameMap::iterator, bool> result =
+       g_routing_id_frame_map.Get().insert(std::make_pair(routing_id_, this));
+@@ -469,6 +472,12 @@ RenderFrameImpl::RenderFrameImpl(RenderViewImpl* render_view, int routing_id)
+ #if defined(ENABLE_NOTIFICATIONS)
+   notification_provider_ = new NotificationProvider(this);
+ #endif
++
++  // ducalpha: assume there are only 3 techniques by now
++  disable_dynamic_energy_saving_activation_ =
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableNetworkAwareProcessing) &&
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAdaptivePainting) &&
++      !CommandLine::ForCurrentProcess()->HasSwitch(switches::kEnableAssistedScheduling);
+ }
+ 
+ RenderFrameImpl::~RenderFrameImpl() {
+@@ -2233,6 +2242,9 @@ void RenderFrameImpl::didHandleOnloadEvents(blink::WebLocalFrame* frame) {
+ #ifdef MARK_FTRACE
+     base::debug::TraceLog::GetInstance()->AddSyncMetadataEvent("Chromium: didHandleOnloadEvents");
+ #endif
++
++    VLOG(0) << "Renderer: Page load finishes";
++    SetEnergySavingTechniquesActivation(false);
+   }
+ }
+ 
+@@ -3277,8 +3289,23 @@ WebElement RenderFrameImpl::GetFocusedElement() {
+ }
+ 
+ void RenderFrameImpl::didStartLoading(bool to_different_document) {
++  // Count starting of the main frame as the beginning of a page start
++  // to avoid enabling techniques for spurious page loadings
++  // Also, do not activate if already activated
++  bool on_main_frame = frame_ && !frame_->parent(),
++      energy_saving_activated = to_different_document && on_main_frame && !energy_saving_activated_;
++
+   render_view_->FrameDidStartLoading(frame_);
+-  Send(new FrameHostMsg_DidStartLoading(routing_id_, to_different_document));
++  Send(new FrameHostMsg_DidStartLoading(routing_id_, to_different_document,
++        energy_saving_activated));
++
++  // ducalpha: activate techniques after sending to reduce delay of IPC
++  TRACE_EVENT2("navigation", "RenderFrameImpl::didStartLoading",
++                     "to_different_document", to_different_document,
++                     "on main frame", on_main_frame);
++  if (energy_saving_activated) {
++    SetEnergySavingTechniquesActivation(true);
++  }
+ }
+ 
+ void RenderFrameImpl::didStopLoading() {
+@@ -3746,4 +3773,18 @@ RendererCdmManager* RenderFrameImpl::GetCdmManager() {
+ }
+ #endif  // defined(ENABLE_BROWSER_CDMS)
+ 
++void RenderFrameImpl::SetEnergySavingTechniquesActivation(bool activated) {
++  if (disable_dynamic_energy_saving_activation_ || activated == energy_saving_activated_)
++    return;
++
++  energy_saving_activated_ = activated;
++
++  std::string debug_message = "Renderer, ";
++  debug_message += activated ? "activate" : "deactivate";
++  debug_message += " energy saving techniques";
++  VLOG(0) << debug_message;
++
++  base::AssistedScheduler::GetInstance()->SetActivation(activated);
++}
++
+ }  // namespace content
+diff --git a/content/renderer/render_frame_impl.h b/content/renderer/render_frame_impl.h
+index 0252170..fe8df42 100644
+--- a/content/renderer/render_frame_impl.h
++++ b/content/renderer/render_frame_impl.h
+@@ -597,6 +597,10 @@ class CONTENT_EXPORT RenderFrameImpl
+   RendererCdmManager* GetCdmManager();
+ #endif
+ 
++  // ducalpha
++  // Activate/deactivate energy saving techniques on the fly
++  void SetEnergySavingTechniquesActivation(bool activated);
++
+   // Stores the WebLocalFrame we are associated with.
+   blink::WebLocalFrame* frame_;
+ 
+@@ -709,6 +713,13 @@ class CONTENT_EXPORT RenderFrameImpl
+   // AccessibilityModeOff.
+   RendererAccessibility* renderer_accessibility_;
+ 
++  // Whether we activate/deactivate energy saving techniques at page load time
++  // and user interaction or not
++  bool disable_dynamic_energy_saving_activation_;
++
++  // Is performing energy saving techniques or not
++  bool energy_saving_activated_;
++
+   base::WeakPtrFactory<RenderFrameImpl> weak_factory_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(RenderFrameImpl);
+diff --git a/ui/base/android/window_android.cc b/ui/base/android/window_android.cc
+index e0e30f9..ae8cfbd 100644
+--- a/ui/base/android/window_android.cc
++++ b/ui/base/android/window_android.cc
+@@ -228,6 +228,7 @@ void WindowAndroid::SetAdaptivePaintingActivation(bool activated) {
+   if (!adaptive_painting_enabled_)
+     return;
+ 
++  VLOG(0) << "WindowAndroid::SetAdaptivePaintingActivation " << activated;
+   adaptive_painting_activated_ = activated;
+ }
+ 

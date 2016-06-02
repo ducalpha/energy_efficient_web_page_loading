@@ -1,0 +1,327 @@
+diff --git a/content/browser/renderer_host/render_widget_host_view_android.cc b/content/browser/renderer_host/render_widget_host_view_android.cc
+index 49ae253..477f0e2 100644
+--- a/content/browser/renderer_host/render_widget_host_view_android.cc
++++ b/content/browser/renderer_host/render_widget_host_view_android.cc
+@@ -602,10 +602,13 @@ void RenderWidgetHostViewAndroid::OnSetNeedsBeginFrame(bool enabled) {
+   DCHECK(!using_synchronous_compositor_);
+   TRACE_EVENT1("cc", "RenderWidgetHostViewAndroid::OnSetNeedsBeginFrame",
+                "enabled", enabled);
+-  if (enabled)
++  if (enabled) {
+     RequestVSyncUpdate(PERSISTENT_BEGIN_FRAME);
+-  else
++  } else {
+     outstanding_vsync_requests_ &= ~PERSISTENT_BEGIN_FRAME;
++    // ducalpha: decrease fps limit when stopping needing VSyncs
++    content_view_core_->GetWindowAndroid()->SetNeedDecreaseFpsLimit();
++  }
+ }
+ 
+ void RenderWidgetHostViewAndroid::OnStartContentIntent(
+diff --git a/ui/base/android/constants.h b/ui/base/android/constants.h
+new file mode 100644
+index 0000000..90bc04d
+--- /dev/null
++++ b/ui/base/android/constants.h
+@@ -0,0 +1,22 @@
++// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
++// Licensed under MIT ($DUC_LICENSE_URL)
++
++#ifndef UI_BASE_ANDROID_CONSTANTS_H_
++#define UI_BASE_ANDROID_CONSTANTS_H_
++
++namespace ui {
++
++// Default is 60 fps
++const int kDefaultFps = 60;
++
++// Trade-off between energy saving and responsiveness
++// Choose 2 for energy saving on slow changing contents
++const int kMinFpsLimit = 2;
++
++// Delay is 100 ms which should be fast enough for users
++// to feel instant responsiveness
++const int kMaxFpsLimit = 10;
++
++}  // namespace ui
++
++#endif  // UI_BASE_ANDROID_CONSTANTS_H_
+diff --git a/ui/base/android/window_android.cc b/ui/base/android/window_android.cc
+index 490c6f3..e0e30f9 100644
+--- a/ui/base/android/window_android.cc
++++ b/ui/base/android/window_android.cc
+@@ -8,10 +8,24 @@
+ #include "base/android/jni_array.h"
+ #include "base/android/jni_weak_ref.h"
+ #include "base/android/scoped_java_ref.h"
++#include "base/command_line.h"
++#include "base/debug/trace_event.h"
++#include "base/strings/string_number_conversions.h"
+ #include "jni/WindowAndroid_jni.h"
++#include "ui/base/android/constants.h"
++#include "ui/base/ui_base_switches.h"
+ #include "ui/base/android/window_android_compositor.h"
+ #include "ui/base/android/window_android_observer.h"
+ 
++
++namespace {
++
++int FpsLimitToPaintingRateDivider(int fps_limit) {
++    return ui::kDefaultFps / fps_limit;
++}
++
++}  // namespace
++
+ namespace ui {
+ 
+ using base::android::AttachCurrentThread;
+@@ -20,7 +34,47 @@ using base::android::ScopedJavaLocalRef;
+ WindowAndroid::WindowAndroid(JNIEnv* env, jobject obj, jlong vsync_period)
+   : weak_java_window_(env, obj),
+     compositor_(NULL),
+-    vsync_period_(base::TimeDelta::FromInternalValue(vsync_period)) {
++    vsync_period_(base::TimeDelta::FromInternalValue(vsync_period)),
++    fps_limit_(0), 
++    need_decrease_fps_limit_(false),
++    last_frame_time_(base::TimeTicks()) {
++  const CommandLine& cmdline = *CommandLine::ForCurrentProcess();
++
++  adaptive_painting_enabled_ =
++      cmdline.HasSwitch(switches::kEnableAdaptivePainting);
++
++  // Activate adaptive painting if it is enabled
++  adaptive_painting_activated_ = adaptive_painting_enabled_;
++
++  // if adaptive_painting_enabled
++  //   fps_limit = fps-limit option or kMaxFpsLimit
++  // else
++  //   if has fps-limit option --> use a fixed fps
++  //   else no fps-limit (original default)
++  if (adaptive_painting_enabled_)
++    fps_limit_ = kMaxFpsLimit;
++
++  // fps-limit value must be positive
++  std::string fps_limit_option = 
++      cmdline.GetSwitchValueASCII(switches::kFpsLimit);
++  if (!fps_limit_option.empty() &&
++       base::StringToInt(fps_limit_option, &fps_limit_)) {
++    if (fps_limit_ <= 0) {
++      fps_limit_ = kMaxFpsLimit;
++      LOG(ERROR) << "FPS limit must be positive, set it to " << fps_limit_;
++    }
++  } else {
++    LOG(ERROR) << "Cannot parse value of switch " << switches::kFpsLimit
++        << ": " << fps_limit_option;
++  }
++
++  if (adaptive_painting_enabled_) {
++    VLOG(1) << "Use adaptive painting rate,"
++        << " initial adaptive fps limit: " << fps_limit_;
++  } else {
++    // For experimentation
++    VLOG(1) << "Use a fixed fps_limit: " << fps_limit_;
++  }
+ }
+ 
+ void WindowAndroid::Destroy(JNIEnv* env, jobject obj) {
+@@ -72,7 +126,14 @@ void WindowAndroid::DetachCompositor() {
+   observer_list_.Clear();
+ }
+ 
++// ducalpha: increase fps limit before requestVSyncUpdate 
+ void WindowAndroid::RequestVSyncUpdate() {
++  TRACE_EVENT0("cc", "WindowAndroid::RequestVSyncUpdate");
++  IncreaseFpsLimit();
++  RequestVSyncUpdateInternal();
++}
++
++void WindowAndroid::RequestVSyncUpdateInternal() {
+   JNIEnv* env = AttachCurrentThread();
+   Java_WindowAndroid_requestVSyncUpdate(env, GetJavaObject().obj());
+ }
+@@ -89,12 +150,85 @@ void WindowAndroid::Animate(base::TimeTicks begin_frame_time) {
+ 
+ void WindowAndroid::OnVSync(JNIEnv* env, jobject obj, jlong time_micros) {
+   base::TimeTicks frame_time(base::TimeTicks::FromInternalValue(time_micros));
++
++  // ducalpha: reduce frame rate by ignoring some VSync signals
++  // Use the fix fps_limit if provided and adaptive painting is not enabled
++  // Will not throttle if (adaptive_painting_enabled_ && fps_limit_ == 0)
++  if ((!adaptive_painting_enabled_ && fps_limit_ > 0) ||
++      (adaptive_painting_enabled_ && adaptive_painting_activated_)) {
++    VLOG(1) << "WindowAndroid::OnVSync fps_limit_: " << fps_limit_;
++    TRACE_EVENT1("cc", "WindowAndroid::OnVSync", "fps_limit", fps_limit_);
++    int painting_rate_divider = FpsLimitToPaintingRateDivider(fps_limit_);
++
++    // skip a number of vsync
++    if (need_decrease_fps_limit_ || 
++        (frame_time >= last_frame_time_ + vsync_period_ * painting_rate_divider)) {
++      last_frame_time_ = frame_time;
++    } else {
++      RequestVSyncUpdateInternal();
++      return;
++    }
++  }
++
+   FOR_EACH_OBSERVER(
+       WindowAndroidObserver,
+       observer_list_,
+       OnVSync(frame_time, vsync_period_));
+   if (compositor_)
+     compositor_->OnVSync(frame_time, vsync_period_);
++
++  // ducalpha
++  if (adaptive_painting_enabled_ && adaptive_painting_activated_
++       && need_decrease_fps_limit_) {
++    DecreaseFpsLimit();
++    need_decrease_fps_limit_ = false;
++  }
++}
++
++void WindowAndroid::SetNeedDecreaseFpsLimit() {
++  if (!adaptive_painting_enabled_ || !adaptive_painting_activated_)
++    return;
++
++  need_decrease_fps_limit_ = true;
++}
++
++void WindowAndroid::IncreaseFpsLimit() {
++  if (!adaptive_painting_enabled_ || !adaptive_painting_activated_)
++    return;
++
++  if (fps_limit_ < kMaxFpsLimit) {
++    ++fps_limit_; // increase by 1 linearly
++  }
++
++  VLOG(2) << "WindowAndroid::IncreaseFpsLimit to " << fps_limit_;
++  TRACE_EVENT1("cc", "WindowAndroid::IncreaseFpsLimit", "FPS limit", fps_limit_);
++}
++
++void WindowAndroid::DecreaseFpsLimit() {
++  if (!adaptive_painting_enabled_ || !adaptive_painting_activated_)
++    return;
++
++  if (fps_limit_ > kMinFpsLimit) {
++    fps_limit_ = kMinFpsLimit; // set directly to min fps limit
++  }
++
++  VLOG(2) << "WindowAndroid::DecreaseFpsLimit to " << fps_limit_;
++  TRACE_EVENT1("cc", "WindowAndroid::DecreaseFpsLimit", "FPS limit", fps_limit_);
++}
++
++int WindowAndroid::FpsLimit() const {
++  if (!adaptive_painting_enabled_) {
++    return kMaxFpsLimit;
++  } else {
++    return fps_limit_;
++  }
++}
++
++void WindowAndroid::SetAdaptivePaintingActivation(bool activated) {
++  if (!adaptive_painting_enabled_)
++    return;
++
++  adaptive_painting_activated_ = activated;
+ }
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/ui/base/android/window_android.h b/ui/base/android/window_android.h
+index cd8ae34..7a8144a 100644
+--- a/ui/base/android/window_android.h
++++ b/ui/base/android/window_android.h
+@@ -56,6 +56,11 @@ class UI_BASE_EXPORT WindowAndroid {
+   void OnVSync(JNIEnv* env, jobject obj, jlong time_micros);
+   void Animate(base::TimeTicks begin_frame_time);
+ 
++  // ducalpha
++  void SetNeedDecreaseFpsLimit();
++  int FpsLimit() const;
++  void SetAdaptivePaintingActivation(bool activated);
++
+  private:
+   ~WindowAndroid();
+ 
+@@ -64,6 +69,27 @@ class UI_BASE_EXPORT WindowAndroid {
+   WindowAndroidCompositor* compositor_;
+   base::TimeDelta vsync_period_;
+ 
++  // ducalpha
++  void IncreaseFpsLimit();
++  void DecreaseFpsLimit();
++  void RequestVSyncUpdateInternal();
++  void AdjustPaintingRateDivider();
++
++  // This flag is set statically from the command line
++  bool adaptive_painting_enabled_;
++
++  // This flag can be set dynamically on run-time
++  bool adaptive_painting_activated_;
++
++  // Use int type, for comparisons on TimeTicks which uses int64 for ticks
++  // fps_limit_ = 0 means we do not limit it
++  int fps_limit_;
++
++  // When need decrease fps_limit (e.g., when stopping VSync)
++  bool need_decrease_fps_limit_;
++
++  base::TimeTicks last_frame_time_;
++
+   ObserverList<WindowAndroidObserver> observer_list_;
+ 
+   DISALLOW_COPY_AND_ASSIGN(WindowAndroid);
+diff --git a/ui/base/ui_base_switches.cc b/ui/base/ui_base_switches.cc
+index 32bb03c..7c0f34f 100644
+--- a/ui/base/ui_base_switches.cc
++++ b/ui/base/ui_base_switches.cc
+@@ -12,6 +12,9 @@ namespace switches {
+ const char kEnableRemoteCoreAnimation[] = "enable-remote-core-animation";
+ #endif
+ 
++// Value for kFpsLimit, whether the fps limit is adaptive or not
++const char kAdaptive[] = "adaptive";
++
+ // Disables use of DWM composition for top level windows.
+ const char kDisableDwmComposition[] = "disable-dwm-composition";
+ 
+@@ -27,6 +30,9 @@ const char kDisableTouchDragDrop[] = "disable-touch-drag-drop";
+ // Disables controls that support touch base text editing.
+ const char kDisableTouchEditing[] = "disable-touch-editing";
+ 
++// Enable adaptive content painting (ACP) technique
++const char kEnableAdaptivePainting[] = "enable-adaptive-painting";
++
+ // Enables an experimental focus manager to track text input clients.
+ const char kEnableTextInputFocusManager[] = "enable-text-input-focus-manager";
+ 
+@@ -36,6 +42,9 @@ const char kEnableTouchDragDrop[] = "enable-touch-drag-drop";
+ // Enables controls that support touch base text editing.
+ const char kEnableTouchEditing[] = "enable-touch-editing";
+ 
++// Set the fps limit for the adaptive paiting technique (for analysis)
++const char kFpsLimit[] = "fps-limit";
++
+ // The language file that we want to try to open. Of the form
+ // language[-country] where language is the 2 letter code from ISO-639.
+ const char kLang[] = "lang";
+diff --git a/ui/base/ui_base_switches.h b/ui/base/ui_base_switches.h
+index c419f41..726be2d 100644
+--- a/ui/base/ui_base_switches.h
++++ b/ui/base/ui_base_switches.h
+@@ -16,14 +16,17 @@ namespace switches {
+ UI_BASE_EXPORT extern const char kEnableRemoteCoreAnimation[];
+ #endif
+ 
++UI_BASE_EXPORT extern const char kAdaptive[];
+ UI_BASE_EXPORT extern const char kDisableDwmComposition[];
+ UI_BASE_EXPORT extern const char kDisableTextInputFocusManager[];
+ UI_BASE_EXPORT extern const char kDisableTouchAdjustment[];
+ UI_BASE_EXPORT extern const char kDisableTouchDragDrop[];
+ UI_BASE_EXPORT extern const char kDisableTouchEditing[];
++UI_BASE_EXPORT extern const char kEnableAdaptivePainting[];
+ UI_BASE_EXPORT extern const char kEnableTextInputFocusManager[];
+ UI_BASE_EXPORT extern const char kEnableTouchDragDrop[];
+ UI_BASE_EXPORT extern const char kEnableTouchEditing[];
++UI_BASE_EXPORT extern const char kFpsLimit[];
+ UI_BASE_EXPORT extern const char kLang[];
+ UI_BASE_EXPORT extern const char kNoMessageBox[];
+ 
