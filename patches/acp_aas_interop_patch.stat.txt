@@ -1,8 +1,6 @@
  base/assisted_scheduling/assisted_scheduler.h                    |  4 ++++
- base/assisted_scheduling/qos_monitor.cc                          | 13 +++++++++----
- base/assisted_scheduling/qos_monitor.h                           |  4 ----
  content/browser/renderer_host/render_widget_host_view_android.cc | 16 +++++++++++++---
  content/common/view_messages.h                                   |  6 ++++++
  content/renderer/gpu/compositor_output_surface.cc                | 10 ++++++++++
  content/renderer/gpu/compositor_output_surface.h                 |  1 +
- 7 files changed, 43 insertions(+), 11 deletions(-)
+ 5 files changed, 34 insertions(+), 3 deletions(-)
