@@ -332,7 +332,7 @@ index 58f66b4..7a42677 100644
 +    private native void nativeSetEnergySavingActivation(long nativeContentViewCoreImpl, boolean activated);
  }
 diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
-index 66bd21c..38f71e0 100644
+index 66bd21c..a7f4078 100644
 --- a/content/renderer/render_frame_impl.cc
 +++ b/content/renderer/render_frame_impl.cc
 @@ -8,6 +8,7 @@
@@ -372,17 +372,20 @@ index 66bd21c..38f71e0 100644
  }
  
  RenderFrameImpl::~RenderFrameImpl() {
-@@ -2233,6 +2242,9 @@ void RenderFrameImpl::didHandleOnloadEvents(blink::WebLocalFrame* frame) {
- #ifdef MARK_FTRACE
+@@ -2234,6 +2243,12 @@ void RenderFrameImpl::didHandleOnloadEvents(blink::WebLocalFrame* frame) {
      base::debug::TraceLog::GetInstance()->AddSyncMetadataEvent("Chromium: didHandleOnloadEvents");
  #endif
+   }
 +
++  // This has the same condition as BrowserProfiler's patch
++  if (!frame->parent()) {
 +    VLOG(0) << "Renderer: Page load finishes";
 +    SetEnergySavingTechniquesActivation(false);
-   }
++  }
  }
  
-@@ -3277,8 +3289,23 @@ WebElement RenderFrameImpl::GetFocusedElement() {
+ void RenderFrameImpl::didFailLoad(blink::WebLocalFrame* frame,
+@@ -3277,8 +3292,23 @@ WebElement RenderFrameImpl::GetFocusedElement() {
  }
  
  void RenderFrameImpl::didStartLoading(bool to_different_document) {
@@ -407,7 +410,7 @@ index 66bd21c..38f71e0 100644
  }
  
  void RenderFrameImpl::didStopLoading() {
-@@ -3746,4 +3773,18 @@ RendererCdmManager* RenderFrameImpl::GetCdmManager() {
+@@ -3746,4 +3776,18 @@ RendererCdmManager* RenderFrameImpl::GetCdmManager() {
  }
  #endif  // defined(ENABLE_BROWSER_CDMS)
  
