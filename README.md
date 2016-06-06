@@ -1,4 +1,4 @@
-# Energy Efficient Web Page Loading
+# Energy-Efficient Web Page Loading
 Patches for Chromium 38 of energy-efficient web page loading techniques
 
 # Documentation
