@@ -25,7 +25,7 @@ index 0000000..90bc04d
 +++ b/ui/base/android/constants.h
 @@ -0,0 +1,22 @@
 +// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
-+// Licensed under MIT ($DUC_LICENSE_URL)
++// Licensed under MIT (https://github.com/ducalpha/energy_efficient_web_page_loading/blob/master/LICENSE)
 +
 +#ifndef UI_BASE_ANDROID_CONSTANTS_H_
 +#define UI_BASE_ANDROID_CONSTANTS_H_

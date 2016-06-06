@@ -5,7 +5,7 @@ index 0000000..ab47dd9
 +++ b/base/assisted_scheduling/assisted_scheduler.cc
 @@ -0,0 +1,163 @@
 +// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
-+// Licensed under MIT ($DUC_LICENSE_URL)
++// Licensed under MIT (https://github.com/ducalpha/energy_efficient_web_page_loading/blob/master/LICENSE)
 +
 +
 +#ifndef BASE_ASSISTED_SCHEDULING_ASSISTED_SCHEDULER_H_g
@@ -550,7 +550,7 @@ index 0000000..ca0a0db
 +++ b/base/third_party/cpu_info/cpu_info_switches.cc
 @@ -0,0 +1,18 @@
 +// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
-+// Licensed under MIT ($DUC_LICENSE_URL)
++// Licensed under MIT (https://github.com/ducalpha/energy_efficient_web_page_loading/blob/master/LICENSE)
 +
 +#include "base/third_party/cpu_info/cpu_info_switches.h"
 +
@@ -574,7 +574,7 @@ index 0000000..b5af4d3
 +++ b/base/third_party/cpu_info/cpu_info_switches.h
 @@ -0,0 +1,21 @@
 +// Copyright 2016 Duc Hoang Bui, KAIST. All rights reserved.
-+// Licensed under MIT ($DUC_LICENSE_URL)
++// Licensed under MIT (https://github.com/ducalpha/energy_efficient_web_page_loading/blob/master/LICENSE)
 +
 +#ifndef ANDROID_TOOLS_CPU_INFO_CPU_INFO_SWITCHES_H_
 +#define ANDROID_TOOLS_CPU_INFO_CPU_INFO_SWITCHES_H_
