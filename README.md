@@ -11,8 +11,7 @@ Patches for Chromium 38 of energy-efficient web page loading techniques
 
 ## Research paper
 ["Rethinking Energy-Performance Trade-Off in Mobile Web Page Loading"](http://cps.kaist.ac.kr/papers/com073-buiA.pdf),
-Duc Hoang Bui, Yunxin Liu, Hyosu Kim, Insik Shin, Feng Zhao,
-Proceedings of the 21st ACM International Conference on Mobile Computing and Networking (MobiCom '15), Paris, France, September 2015.
+by Duc Hoang Bui, Yunxin Liu, Hyosu Kim, Insik Shin and Feng Zhao, in Proceedings of the 21st ACM International Conference on Mobile Computing and Networking (MobiCom '15), Paris, France, September 2015.
 
 More information (talk, introduction and demo videos) is available at the paper's [web page](http://cps.kaist.ac.kr/?page=research/eBrowser/contents.html).
 
