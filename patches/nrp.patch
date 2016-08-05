@@ -119,7 +119,7 @@ index 87d82ca..9b83afd 100644
 +      } else {
 +        // Let data reside in the buffer at most 1/2 sec
 +        max_allocation_size_ = std::min(kMaxMaxAllocationSize,
-+            min_allocation_size_ / 2 * size_multiplier);
++            size_multiplier / 2 * min_allocation_size_);
 +      }
 +
 +      buffer_size_ = std::min(kMaxBufferSize,
