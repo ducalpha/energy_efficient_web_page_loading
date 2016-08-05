@@ -1,5 +1,5 @@
 # Energy-Efficient Web Page Loading
-Patches for Chromium 38 of energy-efficient web page loading techniques
+Improve energy efficiency of web page loading on Google Chromium
 
 ## Video demo for f<span>acebook</span>.com
 [![Video demo for facebook.com](http://img.youtube.com/vi/p5qD1oe2f_0/0.jpg)](https://www.youtube.com/watch?v=p5qD1oe2f_0)
